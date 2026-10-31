@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: trading-assistant
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: GROQ_VISION_MODEL
+        value: qwen/qwen3.8-27b
+      - key: GROQ_CHAT_MODEL
+        value: qwen/qwen3.8-27b
+      - key: GROQ_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
