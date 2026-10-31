@@ -1,17 +1,17 @@
 """Paper trader (FAKE money) for the Trading Plan Assistant.
-
+ 
 It runs in the background on the server. Every few seconds/minutes it checks your symbols
 (crypto, Indian stocks, indices, forex, commodities - anything Yahoo has), takes the same
 BUY / SELL signals as the Live monitor, and "trades" them with virtual money:
-
+ 
   - opens a trade at the entry, with stop-loss and 2 targets
   - at Target 1 it books half and moves the stop to entry (the app's own rule)
   - closes everything at Target 2 or at the stop
   - keeps a history, win rate and total result in R (1R = money risked per trade)
-
+ 
 Safety rules: max 3 open trades, 1 trade per symbol, stops opening new trades for the
 day after -3R, 0.05% cost per side (fees + slippage) is charged on every trade.
-
+ 
 Open the page at  /paper . No real money and no broker is touched.
 Needs ONE gunicorn worker (see render.yaml): gunicorn app:app --workers 1 --threads 4
 """
@@ -21,31 +21,31 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
-
+ 
 from flask import jsonify, request
-
+ 
 STATE_FILE = os.getenv("PAPER_STATE_FILE", "paper_state.json")
 FEE_PCT = 0.05            # cost per side, percent of trade value (fees + slippage)
 MAX_OPEN = 3              # open + waiting orders at the same time
 DAILY_LOSS_R = 3.0        # stop opening new trades for the day after this loss (in R)
 PENDING_MAX_AGE = 3600    # seconds a limit order may wait before it is cancelled
 MAX_SYMBOLS = 8
-
+ 
 _lock = threading.RLock()
 _stop = threading.Event()
 _thread = None
 _live = None
 _recent = {}              # symbol -> last prices (to detect a closed market)
 STATE = None
-
-
+ 
+ 
 # ------------------------------------------------------------------ state
 def _fresh():
     return {"enabled": False, "config": {}, "open": [], "pending": [], "closed": [],
             "events": [], "heartbeat": 0.0, "day": "", "day_r": 0.0,
-            "paused_today": False, "next_id": 1}
-
-
+            "paused_today": False, "next_id": 1, "start_capital": 0.0}
+ 
+ 
 def _load():
     try:
         with open(STATE_FILE) as fh:
@@ -55,8 +55,8 @@ def _load():
         return s
     except Exception:
         return _fresh()
-
-
+ 
+ 
 def _save():
     try:
         tmp = STATE_FILE + ".tmp"
@@ -65,46 +65,61 @@ def _save():
         os.replace(tmp, STATE_FILE)
     except Exception:
         pass
-
-
+ 
+ 
 def _f(v):
     return ("%.5f" % v) if abs(v) < 10 else ("%.2f" % v)
-
-
+ 
+ 
 def _event(text):
     ev = STATE["events"]
     if ev and ev[0]["text"] == text:
         return
     ev.insert(0, {"t": datetime.now(timezone.utc).strftime("%d %b %H:%M UTC"), "text": text})
     del ev[60:]
-
-
+ 
+ 
 def _roll_day():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if STATE["day"] != today:
         STATE["day"] = today
         STATE["day_r"] = 0.0
         STATE["paused_today"] = False
-
-
+ 
+ 
 # ------------------------------------------------------------------ trade logic
 def _pnl(side, entry, exit_, qty):
     gross = (exit_ - entry) * qty if side == "LONG" else (entry - exit_) * qty
     fees = (entry + exit_) * qty * FEE_PCT / 100.0
     return gross - fees
-
-
+ 
+ 
+def _rm(t):
+    """Money value of 1R for this trade, in the user's own capital currency."""
+    rm = t.get("risk_money")
+    if rm:
+        return rm
+    cfg = STATE["config"]
+    return cfg.get("capital", 0) * cfg.get("risk", 0) / 100.0
+ 
+ 
+def _now_r(t):
+    """Open result in R (booked part + what is still open)."""
+    risk = t["risk_amount"] or 1.0
+    return (t["pnl"] + _pnl(t["side"], t["entry"], t["last"], t["qty_left"])) / risk
+ 
+ 
 def _book(t, qty, price):
     t["pnl"] += _pnl(t["side"], t["entry"], price, qty)
     t["qty_left"] = round(t["qty_left"] - qty, 6)
-
-
+ 
+ 
 def _finish(t, reason):
     if t in STATE["open"]:
         STATE["open"].remove(t)
     r = t["pnl"] / t["risk_amount"] if t["risk_amount"] else 0.0
     rec = dict(t)
-    rec.update(reason=reason, r=round(r, 3), closed=time.time())
+    rec.update(reason=reason, r=round(r, 3), money=round(r * _rm(t), 2), closed=time.time())
     STATE["closed"].append(rec)
     del STATE["closed"][:-500]
     STATE["day_r"] += r
@@ -112,19 +127,20 @@ def _finish(t, reason):
     if STATE["day_r"] <= -DAILY_LOSS_R and not STATE["paused_today"]:
         STATE["paused_today"] = True
         _event("Daily loss limit (-%.0fR) reached - no new trades until tomorrow (UTC)." % DAILY_LOSS_R)
-
-
+ 
+ 
 def _new_trade(d, side, entry):
     qty = d["qty"]
-    t = {"id": STATE["next_id"], "symbol": d["symbol"], "tf": d["tf"], "side": side,
+    cfg = STATE["config"]
+    t = {"id": STATE["next_id"], "risk_money": cfg.get("capital", 0) * cfg.get("risk", 0) / 100.0, "symbol": d["symbol"], "tf": d["tf"], "side": side,
          "entry": entry, "stop": d["stop"], "stop0": d["stop"], "t1": d["t1"], "t2": d["t2"],
          "qty": qty, "qty_left": qty, "pnl": 0.0, "be": False,
          "risk_amount": abs(entry - d["stop"]) * qty, "last": entry,
          "placed": time.time(), "opened": None}
     STATE["next_id"] += 1
     return t
-
-
+ 
+ 
 def _manage_open(t, price):
     sign = 1 if t["side"] == "LONG" else -1
     t["last"] = price
@@ -146,8 +162,8 @@ def _manage_open(t, price):
     if t["be"] and sign * (price - t["t2"]) >= 0:             # Target 2
         _book(t, t["qty_left"], t["t2"])
         _finish(t, "target 2")
-
-
+ 
+ 
 def _manage_pending(t, price):
     sign = 1 if t["side"] == "LONG" else -1
     if time.time() - t["placed"] > PENDING_MAX_AGE:
@@ -162,8 +178,8 @@ def _manage_pending(t, price):
         STATE["open"].append(t)
         _event("FILLED %s %s at %s | stop %s | T1 %s" % (t["side"], t["symbol"], _f(t["entry"]),
                                                           _f(t["stop"]), _f(t["t1"])))
-
-
+ 
+ 
 def _handle(d):
     """Apply one fresh signal to the paper account."""
     sym, price = d["symbol"], d["price"]
@@ -198,8 +214,8 @@ def _handle(d):
         STATE["pending"].append(t)
         _event("ORDER %s %s limit at %s | stop %s | T1 %s | qty %s" % (
             side, sym, _f(t["entry"]), _f(t["stop"]), _f(t["t1"]), t["qty"]))
-
-
+ 
+ 
 # ------------------------------------------------------------------ background worker
 def _worker():
     while not _stop.is_set():
@@ -226,8 +242,8 @@ def _worker():
                 STATE["heartbeat"] = time.time()
                 _save()
         _stop.wait(cfg.get("interval", 60))
-
-
+ 
+ 
 def _start_thread():
     global _thread
     with _lock:
@@ -236,8 +252,8 @@ def _start_thread():
         _stop.clear()
         _thread = threading.Thread(target=_worker, daemon=True)
         _thread.start()
-
-
+ 
+ 
 # ------------------------------------------------------------------ views
 def _stats():
     rs = [c["r"] for c in STATE["closed"]]
@@ -248,36 +264,41 @@ def _stats():
         dd = max(dd, peak - eq)
     n = len(rs)
     wins = sum(1 for r in rs if r > 0)
-    return {"trades": n, "wins": wins, "win_rate": round(100.0 * wins / n, 1) if n else 0.0,
+    start = STATE.get("start_capital") or STATE["config"].get("capital", 0)
+    realized = sum(c.get("money", 0.0) for c in STATE["closed"])
+    floating = sum(_now_r(t) * _rm(t) for t in STATE["open"])
+    day_money = STATE["day_r"] * (STATE["config"].get("capital", 0) * STATE["config"].get("risk", 0) / 100.0)
+    return {"start": round(start, 2), "balance": round(start + realized + floating, 2),
+            "profit": round(realized + floating, 2), "realized": round(realized, 2),
+            "floating": round(floating, 2), "day_money": round(day_money, 2), "trades": n, "wins": wins, "win_rate": round(100.0 * wins / n, 1) if n else 0.0,
             "total_r": round(sum(rs), 2), "avg_r": round(sum(rs) / n, 3) if n else 0.0,
             "max_dd_r": round(dd, 2), "day_r": round(STATE["day_r"], 2),
             "paused": STATE["paused_today"]}
-
-
+ 
+ 
 def _view(t):
-    risk = t["risk_amount"] or 1.0
-    now_r = None
-    if t.get("opened"):
-        now_r = round((t["pnl"] + _pnl(t["side"], t["entry"], t["last"], t["qty_left"])) / risk, 2)
+    now_r = round(_now_r(t), 2) if t.get("opened") else None
     return {"id": t["id"], "symbol": t["symbol"], "tf": t["tf"], "side": t["side"],
             "entry": t["entry"], "stop": t["stop"], "t1": t["t1"], "t2": t["t2"],
             "qty": t["qty"], "last": t["last"], "be": t["be"], "now_r": now_r,
-            "reason": t.get("reason"), "r": t.get("r")}
-
-
+            "reason": t.get("reason"), "r": t.get("r"),
+            "money": t.get("money") if t.get("reason") else (round(now_r * _rm(t), 2) if now_r is not None else None),
+            "risk_money": round(_rm(t), 2)}
+ 
+ 
 # ------------------------------------------------------------------ routes
 def register(app, authorized, live_signal, parse_money, ta):
     global _live, STATE
     _live = live_signal
     STATE = _load()
-
+ 
     def guard(d):
         return authorized(d.get("password"))
-
+ 
     @app.get("/paper")
     def paper_page():
         return PAGE
-
+ 
     @app.post("/api/paper/start")
     def paper_start():
         d = request.get_json(silent=True) or {}
@@ -301,11 +322,13 @@ def register(app, authorized, live_signal, parse_money, ta):
             STATE["config"] = {"symbols": syms, "tf": tf, "capital": cap, "risk": risk,
                                "leverage": lev, "interval": interval}
             STATE["enabled"] = True
+            if not STATE.get("start_capital"):
+                STATE["start_capital"] = cap
             _event("Paper trading started: %s on %s, check every %ds" % (", ".join(syms), tf, interval))
             _save()
         _start_thread()
         return jsonify(ok=True)
-
+ 
     @app.post("/api/paper/stop")
     def paper_stop():
         d = request.get_json(silent=True) or {}
@@ -317,7 +340,7 @@ def register(app, authorized, live_signal, parse_money, ta):
             _save()
         _stop.set()
         return jsonify(ok=True)
-
+ 
     @app.post("/api/paper/reset")
     def paper_reset():
         global STATE
@@ -330,7 +353,7 @@ def register(app, authorized, live_signal, parse_money, ta):
             _recent.clear()
             _save()
         return jsonify(ok=True)
-
+ 
     @app.post("/api/paper/status")
     def paper_status():
         d = request.get_json(silent=True) or {}
@@ -345,11 +368,11 @@ def register(app, authorized, live_signal, parse_money, ta):
                 pending=[_view(t) for t in STATE["pending"]],
                 closed=[_view(t) for t in STATE["closed"][-20:]][::-1],
                 events=STATE["events"][:25])
-
+ 
     if STATE["enabled"]:                 # resume after a restart / redeploy
         _start_thread()
-
-
+ 
+ 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -395,8 +418,8 @@ PAGE = r"""<!doctype html>
   <p class="err" id="msg"></p>
   <p class="note" id="status"></p>
 </section>
-<section><h2>Result so far <span class="note">in R (1R = the money risked on one trade)</span></h2><div class="grid" id="stats"></div>
-  <p class="note">Results are shown in R because crypto is priced in USD and Indian stocks in INR. Fees and slippage (0.05% per side) are included.</p></section>
+<section><h2>Result so far <span class="note">money in your capital currency, and in R</span></h2><div class="grid" id="stats"></div>
+  <p class="note">Money = result in R x the amount you risk per trade (capital x risk %), so BTC (USD), Nifty (INR) and forex all add up in one currency. Fees and slippage (0.05% per side) are included.</p></section>
 <section><h2>Open trades</h2><div id="open"></div><h2 style="margin-top:12px">Waiting limit orders</h2><div id="pend"></div></section>
 <section><h2>Closed trades (last 20)</h2><div id="closed"></div></section>
 <section><h2>Log</h2><div id="ev"></div></section>
@@ -406,6 +429,8 @@ const $ = id => document.getElementById(id);
 function el(tag, cls, text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!=null)e.textContent=text; return e;}
 const f = v => v==null ? '-' : (Math.abs(v)<10 ? v.toFixed(5) : v.toFixed(2));
 const sg = v => (v>0?'+':'')+v.toFixed(2)+'R';
+const mn = v => (v==null ? '-' : (v>0?'+':v<0?'-':'')+Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:2}));
+const am = v => Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
 try{ $('pw').value = sessionStorage.getItem('ppw')||''; }catch(e){}
 function msg(t){ $('msg').textContent = t||''; }
 async function api(path, body){
@@ -423,9 +448,10 @@ function tradeBox(t, closed){
   const b = el('div','t'), h = el('div');
   h.appendChild(el('span','tag '+t.side,t.side)); h.appendChild(el('b','',t.symbol+' | '+t.tf));
   b.appendChild(h);
+  b.appendChild(el('div','note','Amount risked on this trade: '+am(t.risk_money)));
   b.appendChild(el('div','','Entry '+f(t.entry)+' | Stop '+f(t.stop)+' | T1 '+f(t.t1)+' | T2 '+f(t.t2)+' | Qty '+t.qty));
-  if(closed){ const c = el('div', t.r>0?'pos':'neg', t.reason+': '+sg(t.r)); b.appendChild(c); }
-  else if(t.now_r!=null){ const c = el('div', t.now_r>=0?'pos':'neg', 'Price '+f(t.last)+' | now '+sg(t.now_r)+(t.be?' | stop at entry':'')); b.appendChild(c); }
+  if(closed){ const c = el('div', t.r>0?'pos':'neg', t.reason+': '+mn(t.money)+' money ('+sg(t.r)+')'); b.appendChild(c); }
+  else if(t.now_r!=null){ const c = el('div', t.now_r>=0?'pos':'neg', 'Price '+f(t.last)+' | now '+mn(t.money)+' money ('+sg(t.now_r)+')'+(t.be?' | stop at entry':'')); b.appendChild(c); }
   else b.appendChild(el('div','note','Waiting for price to reach '+f(t.entry)));
   return b;
 }
@@ -437,8 +463,10 @@ function render(d){
   $('status').textContent = (d.running?'RUNNING':'STOPPED')+(c.symbols?' | '+c.symbols.join(', ')+' | '+c.tf:'')
     +(d.age!=null?' | last check '+Math.round(d.age)+'s ago':'');
   const g = $('stats'); g.textContent='';
-  [['Trades',s.trades],['Win rate',s.win_rate+'%'],['Total',sg(s.total_r)],['Average',sg(s.avg_r)],
-   ['Worst drawdown',s.max_dd_r+'R'],['Today',sg(s.day_r)+(s.paused?' (paused)':'')]].forEach(x=>{
+  [['Starting money',am(s.start)],['Money now',am(s.balance)],['Profit / Loss',mn(s.profit)],
+   ['Today',mn(s.day_money)+(s.paused?' (paused)':'')],['Still open (floating)',mn(s.floating)],['Closed result',mn(s.realized)],
+   ['Trades',s.trades],['Win rate',s.win_rate+'%'],['Total',sg(s.total_r)],['Average',sg(s.avg_r)],
+   ['Worst drawdown',s.max_dd_r+'R']].forEach(x=>{
     const b=el('div','box'); b.appendChild(el('b','',String(x[1]))); b.appendChild(el('span','',x[0])); g.appendChild(b); });
   fill('open', d.open, false, 'No open trades.');
   fill('pend', d.pending, false, 'No waiting orders.');
@@ -448,3 +476,4 @@ function render(d){
 async function refresh(){ try{ render(await api('/api/paper/status')); }catch(e){ msg(e.message);} }
 refresh(); setInterval(refresh, 5000);
 </script></body></html>"""
+ 
