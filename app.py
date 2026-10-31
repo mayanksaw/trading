@@ -811,6 +811,7 @@ def api_signal():
     except Exception as e:
         return jsonify(error="Could not get data: %s" % e), 502
 
-
+import paper_trader
+paper_trader.register(app, authorized, live_signal, parse_money, ta)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
