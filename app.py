@@ -474,6 +474,7 @@ def call_vision(key, b64):
         ta.GROQ_URL, timeout=90,
         headers={"Authorization": "Bearer " + key},
         json={"model": VISION_MODEL, "temperature": 0.1,
+              "max_tokens": 700,
               "response_format": {"type": "json_object"},
               "messages": [{"role": "user", "content": [
                   {"type": "text", "text": VISION_PROMPT},
