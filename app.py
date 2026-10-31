@@ -138,6 +138,7 @@ PAGE = """<!doctype html>
 </style></head><body>
 <h1>Trading Plan Assistant</h1>
 <p class="sub">Upload a chart screenshot or type a symbol. A planning tool, not financial advice.</p>
+<p><a href="/paper" style="color:#58a6ff;font-weight:700">Open Paper Trader (automatic fake-money trading) &rarr;</a></p>
 <form method="post" action="/" enctype="multipart/form-data" id="f">
   <fieldset><legend>Option 1: chart screenshot</legend>
     <label>Choose a screenshot, or press Ctrl+V to paste one
