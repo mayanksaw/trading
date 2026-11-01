@@ -58,7 +58,8 @@ HTF = {"5m": "1h", "15m": "1h", "30m": "1h", "1h": "1d", "1d": "1wk", "1wk": Non
 
 DEFAULTS = {"max_open": 3, "daily_loss_r": 3.0, "max_group": 2, "max_risk_pct": 3.0,
             "streak_n": 3, "cooldown_min": 60, "max_dd_r": 10.0, "mtf": True,
-            "trail": False, "time_stop_bars": 20, "min_evidence": 0}
+            "trail": False, "time_stop_bars": 20, "min_evidence": 0,
+            "use_model": True, "use_ai": True, "min_votes": 0}
 
 _lock = threading.RLock()
 _lab_lock = threading.Lock()
@@ -313,6 +314,219 @@ def _manage_pending(t, price):
                                                           _f(t["stop"]), _f(t["t1"])))
 
 
+# ------------------------------------------------------------------ extra AI tools: edge model + AI second opinion
+_models = {}              # (ticker, tf) -> {"state": "training"|"ready", "model": dict|None, "t": time}
+_models_mutex = threading.Lock()
+_model_lock = threading.Lock()
+MODEL_TTL = 6 * 3600
+_ai_gate = [0.0]
+
+AI_VOTE_SYSTEM = ("You are a cautious trading analyst giving a second opinion on a paper-trading call. Use ONLY the data "
+                  "given. Reply with ONE JSON object and nothing else: "
+                  '{"verdict":"agree" or "disagree" or "unsure","confidence":"low" or "medium" or "high",'
+                  '"reason":"max 18 words"}. Say disagree when the trend, momentum, nearby support/resistance, the '
+                  "higher timeframe or the reward:risk argue against the trade. Never promise anything.")
+
+
+def _features(sign, price, e20, e50, macd, rsi, atr, risk):
+    vals = (price, e20, e50, macd, rsi, atr, risk)
+    if any(v is None or v != v for v in vals) or not atr or atr <= 0 or not price:
+        return None
+    return [float(sign), sign * (price - e50) / atr, sign * (e20 - e50) / atr, sign * macd / atr,
+            sign * (rsi - 50.0) / 50.0, atr / price * 100.0, risk / atr]
+
+
+def _fit_logit(X, y, l2=1.0, iters=500, lr=0.2):
+    import numpy as np
+    n, m = X.shape
+    Xb = np.hstack([np.ones((n, 1)), X])
+    w = np.zeros(m + 1)
+    for _ in range(iters):
+        p = 1.0 / (1.0 + np.exp(-np.clip(Xb @ w, -30, 30)))
+        g = Xb.T @ (p - y) / n
+        g[1:] += l2 * w[1:] / n
+        w -= lr * g
+    return w
+
+
+def _predict(w, X):
+    import numpy as np
+    Xb = np.hstack([np.ones((X.shape[0], 1)), X])
+    return 1.0 / (1.0 + np.exp(-np.clip(Xb @ w, -30, 30)))
+
+
+def _label(df, i, plan, hold=20, rr=1.5):
+    """1 = target reached before the stop, 0 = stop first, None = neither (same rule as the backtest)."""
+    sign = 1 if plan["direction"] == "LONG" else -1
+    entry, risk = float(df["open"].iloc[i + 1]), plan["risk"]
+    stop, target = entry - sign * risk, entry + sign * rr * risk
+    for j in range(i + 1, i + 1 + hold):
+        lo, hi = float(df["low"].iloc[j]), float(df["high"].iloc[j])
+        if (lo <= stop) if sign == 1 else (hi >= stop):
+            return 0
+        if (hi >= target) if sign == 1 else (lo <= target):
+            return 1
+    return None
+
+
+def _train_model(ticker, tf):
+    """Learn from this symbol's own past setups and TEST on the newest 30% it has never seen."""
+    import numpy as np
+    df = _ta.get_data(ticker, tf)
+    if df is None or len(df) < 300:
+        return {"useful": False, "why": "not enough price history"}
+    df = _ta.add_indicators(df)
+    X, y = [], []
+    for i in range(60, len(df) - 22, 3):
+        plan = _ta.make_plan(df, i)
+        if plan["direction"] == "WAIT":
+            continue
+        lab = _label(df, i, plan)
+        if lab is None:
+            continue
+        r = df.iloc[i]
+        f = _features(1 if plan["direction"] == "LONG" else -1, float(r["close"]), float(r["ema20"]), float(r["ema50"]),
+                      float(r["macd_hist"]), float(r["rsi"]), float(r["atr"]), float(plan["risk"]))
+        if f is not None:
+            X.append(f)
+            y.append(lab)
+    n = len(y)
+    if n < 60:
+        return {"useful": False, "why": "only %d past setups (need 60)" % n, "n": n}
+    X, y = np.array(X, float), np.array(y, float)
+    cut = int(n * 0.7)
+    mu, sd = X[:cut].mean(0), X[:cut].std(0) + 1e-9
+    w = _fit_logit((X[:cut] - mu) / sd, y[:cut])
+    pt = _predict(w, (X[cut:] - mu) / sd)
+    yt = y[cut:]
+    base = float(yt.mean())
+    k = max(1, int(len(yt) * 0.4))
+    order = np.argsort(-pt)[:k]
+    prec = float(yt[order].mean())
+    thr = float(np.sort(pt)[-k])
+    useful = len(yt) >= 30 and k >= 12 and prec >= base + 0.05
+    mu2, sd2 = X.mean(0), X.std(0) + 1e-9
+    w2 = _fit_logit((X - mu2) / sd2, y)
+    return {"useful": bool(useful), "n": n, "n_test": int(len(yt)), "base": round(base, 3), "precision_top": round(prec, 3),
+            "thr": thr, "w": w2.tolist(), "mu": mu2.tolist(), "sd": sd2.tolist(),
+            "why": "" if useful else "no clear edge on data it had not seen"}
+
+
+def _train_job(ticker, tf):
+    with _model_lock:
+        try:
+            m = _train_model(ticker, tf)
+        except Exception as e:
+            m = {"useful": False, "why": "training failed: %s" % str(e)[:60]}
+    with _models_mutex:
+        _models[(ticker, tf)] = {"state": "ready", "model": m, "t": time.time()}
+
+
+def _get_model(ticker, tf):
+    """The trained model, or None while it is still training (training runs in the background)."""
+    key, now = (ticker, tf), time.time()
+    with _models_mutex:
+        ent = _models.get(key)
+        if ent and ent["state"] == "ready" and now - ent["t"] < MODEL_TTL:
+            return ent["model"]
+        if ent and ent["state"] == "training":
+            return ent.get("model")
+        _models[key] = {"state": "training", "model": ent["model"] if ent else None, "t": now}
+        old = ent["model"] if ent else None
+    threading.Thread(target=_train_job, args=(ticker, tf), daemon=True).start()
+    return old
+
+
+def _warm_models(cfg):
+    for sym in cfg.get("symbols", []):
+        try:
+            _get_model(_ta.resolve_symbol(sym), cfg["tf"])
+        except Exception:
+            pass
+
+
+def _edge_prob(d, tf):
+    """Chance that this call reaches Target 1 before the stop, according to the model (None if not trusted)."""
+    import numpy as np
+    ticker = d.get("ticker", d["symbol"])
+    m = _get_model(ticker, tf)
+    if not m or not m.get("useful"):
+        return None
+    data = _chart_data(_ta, ticker, tf)
+    if not data:
+        return None
+    sign = 1 if str(d.get("decision", "")).startswith("BUY") else -1
+    entry = d.get("entry") or data["c"][-1]
+    f = _features(sign, data["c"][-1], data["e20"][-1], data["e50"][-1], data["macd"][-1], data["rsi"][-1],
+                  data["atr"], abs(entry - d["stop"]))
+    if f is None:
+        return None
+    x = (np.array(f) - np.array(m["mu"])) / np.array(m["sd"])
+    return {"p": float(_predict(np.array(m["w"]), x[None, :])[0]), "thr": m["thr"]}
+
+
+def _ai_opinion(d, tf):
+    """A second opinion from the AI model on one call (None when the AI is unavailable or busy)."""
+    import re
+    key = os.getenv("GROQ_API_KEY")
+    if not key or time.time() - _ai_gate[0] < 4:
+        return None
+    _ai_gate[0] = time.time()
+    snap = _snapshot(_ta, d["symbol"], tf)
+    user = "Call: %s %s, entry %s, stop %s, target 1 %s.\nData: %s" % (
+        d.get("decision"), d["symbol"], _f(d.get("entry") or d["price"]), _f(d["stop"]), _f(d["t1"]),
+        json.dumps(snap)[:1500])
+    msg = _coach_call(_ta, key, [{"role": "system", "content": AI_VOTE_SYSTEM}, {"role": "user", "content": user}],
+                      False, max_tokens=120)
+    m = re.search(r"\{.*\}", msg.get("content") or "", re.S)
+    if not m:
+        return None
+    o = json.loads(m.group(0))
+    verdict, conf = str(o.get("verdict", "")).lower(), str(o.get("confidence", "")).lower()
+    if verdict not in ("agree", "disagree", "unsure") or conf not in ("low", "medium", "high"):
+        return None
+    return {"verdict": verdict, "confidence": conf, "reason": str(o.get("reason", ""))[:140]}
+
+
+def _enrich(d, cfg):
+    """Collect the extra opinions for a NEW call. Runs outside the lock because it can take a few seconds."""
+    d["model"], d["ai"] = None, None
+    if cfg.get("use_model", True):
+        try:
+            d["model"] = _edge_prob(d, cfg["tf"])
+        except Exception:
+            d["model"] = None
+    if cfg.get("use_ai", True):
+        try:
+            d["ai"] = _ai_opinion(d, cfg["tf"])
+        except Exception:
+            d["ai"] = None
+
+
+def _ai_tools_view():
+    cfg = STATE["config"]
+    rows = []
+    for sym in cfg.get("symbols", []):
+        try:
+            ent = _models.get((_ta.resolve_symbol(sym), cfg.get("tf")))
+        except Exception:
+            ent = None
+        m = ent["model"] if ent else None
+        if ent is None:
+            state, note = "waiting", "not started yet"
+        elif ent["state"] == "training" and not m:
+            state, note = "training", "learning from past data..."
+        elif m and m.get("useful"):
+            state = "trusted"
+            note = "on unseen data: right %.0f%% when it was confident, vs %.0f%% for all setups (%d tests)" % (
+                100 * m["precision_top"], 100 * m["base"], m["n_test"])
+        else:
+            state, note = "not trusted", (m or {}).get("why", "") or "no clear edge"
+        rows.append({"symbol": sym.upper(), "state": state, "note": note})
+    return {"use_model": bool(_c("use_model")), "use_ai": bool(_c("use_ai")),
+            "ai_key": bool(os.getenv("GROQ_API_KEY")), "models": rows}
+
+
 PRED_BARS = 20            # a call is graded within this many candles
 
 
@@ -353,12 +567,24 @@ def _pred_group(preds):
 
 def _scorecard():
     preds = STATE["preds"]
+    cons = lambda p: p.get("consensus", 1 + int(bool(p.get("htf_ok"))))   # old calls: rules + higher timeframe only
     syms = sorted({p["symbol"] for p in preds})
     by_symbol = [dict(_pred_group([p for p in preds if p["symbol"] == sym]), symbol=sym) for sym in syms]
     recent = [{"symbol": p["symbol"], "side": p["side"], "status": p["status"], "entry": p["entry"],
                "stop": p["stop"], "t1": p["t1"], "htf_ok": p.get("htf_ok", False),
+               "consensus": cons(p), "model_p": p.get("model_p"), "ai_verdict": p.get("ai_verdict"),
+               "ai_conf": p.get("ai_conf"), "ai_reason": p.get("ai_reason"),
                "age_min": int((time.time() - p["created"]) // 60)} for p in preds[-12:]][::-1]
-    return {"all": _pred_group(preds), "by_symbol": sorted(by_symbol, key=lambda g: -g["n"]),
+    by_votes = [dict(_pred_group([p for p in preds if cons(p) == k]), votes=k) for k in (1, 2, 3, 4)]
+    voters = []
+    for key, label in (("htf", "Higher timeframe"), ("model", "Edge model"), ("ai", "AI second opinion")):
+        def vote(p, key=key):
+            v = (p.get("votes") or {}).get(key) if p.get("votes") else (bool(p.get("htf_ok")) if key == "htf" else None)
+            return v
+        voters.append({"voter": label, "yes": _pred_group([p for p in preds if vote(p) is True]),
+                       "no": _pred_group([p for p in preds if vote(p) is False])})
+    return {"by_votes": by_votes, "voters": voters, "all": _pred_group(preds),
+            "by_symbol": sorted(by_symbol, key=lambda g: -g["n"]),
             "htf_agrees": _pred_group([p for p in preds if p.get("htf_ok")]),
             "htf_other": _pred_group([p for p in preds if not p.get("htf_ok")]), "recent": recent}
 
@@ -402,11 +628,22 @@ def _pred_create(d, price):
         return
     now = time.time()
     horizon = PRED_BARS * TF_MIN.get(d.get("tf", "15m"), 15) * 60
+    rr = abs(t1 - entry) / abs(entry - stop)
+    be_call = 1.0 / (1.0 + rr) + 0.03
+    htf_ok = d.get("htf") == ("up" if side == "LONG" else "down")
+    model, ai = d.get("model"), d.get("ai")
+    model_yes = bool(model and model["p"] >= max(model["thr"], be_call))
+    ai_yes = bool(ai and ai.get("verdict") == "agree" and ai.get("confidence") in ("medium", "high"))
+    consensus = 1 + int(htf_ok) + int(model_yes) + int(ai_yes)
     STATE["preds"].append({
+        "votes": {"htf": htf_ok, "model": model_yes if model else None, "ai": ai_yes if ai else None},
+        "consensus": consensus, "model_p": round(model["p"], 3) if model else None,
+        "ai_verdict": ai.get("verdict") if ai else None, "ai_conf": ai.get("confidence") if ai else None,
+        "ai_reason": ai.get("reason") if ai else None,
         "id": STATE["next_pred"], "symbol": sym, "tf": d.get("tf"), "side": side, "entry": entry, "stop": stop,
-        "t1": t1, "rr": abs(t1 - entry) / abs(entry - stop), "status": "open", "armed": now_call,
+        "t1": t1, "rr": rr, "status": "open", "armed": now_call,
         "armed_at": now if now_call else 0.0, "created": now, "closed": 0.0, "horizon": horizon,
-        "expires": now + horizon, "htf_ok": d.get("htf") == ("up" if side == "LONG" else "down")})
+        "expires": now + horizon, "htf_ok": htf_ok})
     STATE["next_pred"] += 1
     del STATE["preds"][:-500]
 
@@ -454,6 +691,11 @@ def _handle(d):
         g = _pred_group([x for x in STATE["preds"] if x["symbol"] == sym])
         if g["n"] < need or g["lo"] <= g["breakeven"]:
             return
+    mv = _c("min_votes")
+    if mv:                                                    # trade only when enough independent opinions agree
+        cp = next((x for x in STATE["preds"] if x["symbol"] == sym and x["status"] == "open"), None)
+        if cp is None or cp.get("consensus", 1) < mv:
+            return
     if decision.endswith("NOW"):
         if not (sign * (price - d["stop"]) > 0 and sign * (d["t1"] - price) > 0):
             return
@@ -484,6 +726,11 @@ def _worker():
                 d = _live(sym, cfg["tf"], cfg["capital"], cfg["risk"], cfg["leverage"])
                 if cfg.get("mtf", True) and d.get("decision", "WAIT") != "WAIT":
                     d["htf"] = _htf_trend(d.get("ticker", sym), cfg["tf"])
+                if d.get("decision", "WAIT") != "WAIT":
+                    with _lock:
+                        fresh = not any(p["symbol"] == d["symbol"] and p["status"] == "open" for p in STATE["preds"])
+                    if fresh:
+                        _enrich(d, cfg)
             except Exception as e:
                 d, err = None, str(e)[:100]
             with _lock:
@@ -607,7 +854,7 @@ SETTABLE = {"max_open": ("int", 1, 8), "daily_loss_r": ("float", 0.5, 10), "risk
             "max_group": ("int", 1, 8), "max_risk_pct": ("float", 0.5, 20), "streak_n": ("int", 0, 10),
             "cooldown_min": ("int", 1, 1440), "max_dd_r": ("float", 0, 100),
             "time_stop_bars": ("int", 0, 500), "mtf": ("bool",), "trail": ("bool",),
-            "min_evidence": ("int", 0, 200)}
+            "min_evidence": ("int", 0, 200), "min_votes": ("int", 0, 4), "use_model": ("bool",), "use_ai": ("bool",)}
 
 COACH_SYSTEM = """You are Paper Coach, a sharp and honest trading coach inside a PAPER-TRADING (fake money) app.
 You can see the user's paper account and the chart they are looking at (data below), and you have tools.
@@ -618,6 +865,7 @@ How to work:
 - Be honest about weak evidence: fewer than 30 closed trades is too few to judge a strategy. Point out risk problems (many trades in one market group, big drawdown, no stop-loss thinking).
 - Never promise profit and never say a trade will win. When you discuss a setup, remind briefly that this is paper trading and not financial advice. No real broker is connected.
 - Reply in the language the user writes in (English, Hindi or Hinglish). Keep answers short (under 120 words unless asked for detail). Plain text only: no markdown symbols, no tables; short lines are fine.
+- More independent opinions (higher timeframe, edge model, AI second opinion) only help if the scorecard shows higher accuracy with more votes; say what the numbers show, not what sounds nice.
 - If the user asks for guaranteed, certain or 100% correct predictions, explain kindly that this is impossible for anyone, and point to the scorecard of the app's real hit rate instead.
 - If the question is not about trading, markets or this app, politely say you only help with trading."""
 
@@ -822,6 +1070,14 @@ def _account_brief():
                     "triggered, %d open | right %.0f%% (likely range %.0f-%.0f%%) | break-even needs %.0f%% | %s" % (
                         sc["n"], sc["hits"], sc["misses"], sc["expired"] + sc["void"], sc["open"], sc["rate"],
                         sc["lo"], sc["hi"], sc["breakeven"], sc["verdict"]))
+        tools = _ai_tools_view()
+        rows.append("Extra AI tools: edge model %s, AI second opinion %s (%s) | votes -> %s" % (
+            "on" if tools["use_model"] else "off", "on" if tools["use_ai"] else "off",
+            "key set" if tools["ai_key"] else "no GROQ key",
+            "; ".join("%d votes: %d finished, %.0f%% right" % (g["votes"], g["n"], g["rate"])
+                      for g in _scorecard()["by_votes"] if g["n"]) or "no finished calls yet"))
+        for m in tools["models"]:
+            rows.append("MODEL %s: %s (%s)" % (m["symbol"], m["state"], m["note"][:90]))
         for t in STATE["open"]:
             rows.append("OPEN #%d %s %s entry %s stop %s T1 %s now %+.2fR%s" % (
                 t["id"], t["side"], t["symbol"], _f(t["entry"]), _f(t["stop"]), _f(t["t1"]), _now_r(t),
@@ -924,14 +1180,14 @@ def _coach_models():
     return list(dict.fromkeys(models))
 
 
-def _coach_call(ta, key, messages, use_tools):
+def _coach_call(ta, key, messages, use_tools, max_tokens=450):
     """One model call. A missing or rate-limited model falls through to the next model."""
     import re
     import requests
     url = getattr(ta, "GROQ_URL", GROQ_URL_DEFAULT)
     last = "no AI model is available"
     for model in _coach_models():
-        body = {"model": model, "temperature": 0.3, "max_tokens": 450, "messages": messages}
+        body = {"model": model, "temperature": 0.3, "max_tokens": max_tokens, "messages": messages}
         if use_tools:
             body.update(tools=COACH_TOOLS, tool_choice="auto")
         resp = requests.post(url, timeout=45, headers={"Authorization": "Bearer " + key}, json=body)
@@ -1067,7 +1323,9 @@ def register(app, authorized, live_signal, parse_money, ta):
                "max_dd_r": _num(d, "max_dd_r", 10.0, 0.0, 100.0),
                "time_stop_bars": _num(d, "time_stop_bars", 20, 0, 500, int),
                "mtf": bool(d.get("mtf", True)), "trail": bool(d.get("trail", False)),
-               "min_evidence": _num(d, "min_evidence", 0, 0, 200, int)}
+               "min_evidence": _num(d, "min_evidence", 0, 0, 200, int),
+               "min_votes": _num(d, "min_votes", 0, 0, 4, int),
+               "use_model": bool(d.get("use_model", True)), "use_ai": bool(d.get("use_ai", True))}
         with _lock:
             STATE["config"] = cfg
             STATE["enabled"] = True
@@ -1076,6 +1334,7 @@ def register(app, authorized, live_signal, parse_money, ta):
             _event("Paper trading started: %s on %s, check every %ds" % (", ".join(syms), tf, cfg["interval"]))
             _save()
         _start_thread()
+        threading.Thread(target=_warm_models, args=(cfg,), daemon=True).start()
         return jsonify(ok=True)
 
     @app.post("/api/paper/stop")
@@ -1133,7 +1392,8 @@ def register(app, authorized, live_signal, parse_money, ta):
                 stats=_stats(), open=[_view(t) for t in STATE["open"]],
                 pending=[_view(t) for t in STATE["pending"]],
                 closed=[_view(t) for t in STATE["closed"][-20:]][::-1],
-                events=STATE["events"][:25], curve=_curve(), by_symbol=_by_symbol(), scorecard=_scorecard())
+                events=STATE["events"][:25], curve=_curve(), by_symbol=_by_symbol(), scorecard=_scorecard(),
+                ai_tools=_ai_tools_view())
 
     @app.post("/api/paper/close")
     def paper_close():
@@ -1226,8 +1486,12 @@ def register(app, authorized, live_signal, parse_money, ta):
                     marks.append({"t": int(c["opened"]), "price": c["entry"], "side": c["side"], "r": c["r"]})
             signal = _last_sig.get(key)
             track = _pred_group([x for x in STATE["preds"] if x["symbol"] == key])
+            cp = next((x for x in STATE["preds"] if x["symbol"] == key and x["status"] == "open"), None)
+            call = None if cp is None else {"consensus": cp.get("consensus", 1), "votes": cp.get("votes") or {},
+                                            "model_p": cp.get("model_p"), "ai_verdict": cp.get("ai_verdict"),
+                                            "ai_conf": cp.get("ai_conf"), "ai_reason": cp.get("ai_reason")}
         return jsonify(symbol=key, ticker=ticker, tf=tf, candles=data, trades=trades, marks=marks, signal=signal,
-                       track=track)
+                       track=track, call=call)
 
     @app.post("/api/paper/chat")
     def paper_chat():
@@ -1325,6 +1589,7 @@ def register(app, authorized, live_signal, parse_money, ta):
 
     if STATE["enabled"]:                 # resume after a restart / redeploy
         _start_thread()
+        threading.Thread(target=_warm_models, args=(dict(STATE["config"]),), daemon=True).start()
 
 
 PAGE = r"""<!doctype html>
@@ -1370,6 +1635,7 @@ PAGE = r"""<!doctype html>
   .tag.WAIT{background:#4a5563}
   .sc{display:grid;grid-template-columns:1.2fr .7fr .8fr 1.3fr 2fr;gap:6px;font-size:.82rem;padding:6px 0;border-bottom:1px solid #2c3a4a}
   .sc.h{color:#9aa4af;font-size:.75rem}
+  .chk.sm{font-size:.8rem}
   #coach{display:flex;flex-direction:column;height:640px}
   #clog{flex:1;overflow-y:auto;display:grid;gap:8px;align-content:start;margin-bottom:8px;padding-right:2px}
   .cb{padding:8px 12px;border-radius:10px;white-space:pre-wrap;word-break:break-word;font-size:.88rem;line-height:1.4;max-width:94%}
@@ -1420,6 +1686,8 @@ PAGE = r"""<!doctype html>
   <details>
     <summary>Advanced rules (strategy + safety)</summary>
     <label class="chk"><input id="mtf" type="checkbox" checked> Trade only with the higher-timeframe trend (a 15m trade needs the 1h trend to agree)</label>
+    <label class="chk"><input id="umodel" type="checkbox" checked> Edge model: a small learned model (tested on data it never saw) gives a vote</label>
+    <label class="chk"><input id="uai" type="checkbox" checked> AI second opinion: the AI reviews every new call and gives a vote</label>
     <label class="chk"><input id="trail" type="checkbox"> After Target 1, trail the stop and let the winner run (instead of closing at Target 2)</label>
     <div class="row">
       <label>Max trades per market group, same direction<input id="mg" type="number" min="1" max="8" value="2"></label>
@@ -1431,6 +1699,7 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="row">
       <label>Trade a symbol only after its own record proves an edge (finished calls needed, 0 = off)<input id="mev" type="number" min="0" max="200" value="0"></label>
+      <label>Trade only when this many opinions agree (1 = rules only, up to 4, 0 = off)<input id="mvotes" type="number" min="0" max="4" value="0"></label>
       <label>Halt everything at drawdown (R, 0 = off)<input id="mdd" type="number" step="any" min="0" max="100" value="10"></label>
       <label>Time stop: close if Target 1 is not reached after (candles, 0 = off)<input id="tsb" type="number" min="0" max="500" value="20"></label>
     </div>
@@ -1509,6 +1778,13 @@ PAGE = r"""<!doctype html>
   <div id="schtf" class="note" style="margin-top:8px"></div>
   <h2 style="margin-top:14px">Latest calls</h2><div id="screcent"></div>
   <p class="note">Every BUY/SELL call is logged, even ones your safety rules blocked, and graded later: right = price reached Target 1 first, wrong = it hit the stop first, expired = neither within 20 candles. The range is a 95% statistical range: with few calls it is wide, so do not trust a good-looking rate until the range sits above the break-even rate. Break-even is the win rate needed to cover the risk:reward and costs. No system is right 100% of the time; this page shows the truth instead of a promise.</p></section>
+<section><h2>AI tools <span class="note">extra opinions on every call, checked by the scorecard</span></h2>
+  <div id="aimodels"></div>
+  <p class="note" id="aistatus"></p>
+  <h2 style="margin-top:12px">Does more agreement mean more accuracy?</h2>
+  <div id="aivotes"></div>
+  <div id="aivoters" class="note" style="margin-top:8px"></div>
+  <p class="note">Each new call gets up to 4 opinions: the app's rules (always yes), the higher-timeframe trend, the edge model and the AI second opinion. A tool only deserves your trust if calls with more agreeing opinions are really right more often in the table above. If the numbers do not rise, ignore that tool. Opinions that are unavailable count as "no".</p></section>
 <section><h2>Money curve</h2><svg id="curve" viewBox="0 0 700 150" style="width:100%;height:150px"></svg></section>
 <section><h2>Which symbols work</h2><div id="bysym"></div>
   <h2 style="margin-top:14px">How trades ended</h2><div id="exits"></div></section>
@@ -1539,7 +1815,8 @@ async function api(path, body){
 function cfgBody(){ return {symbols:$('syms').value, tf:$('tf').value, capital:$('cap').value, risk:$('risk').value,
   leverage:$('lev').value, interval:$('intv').value, max_open:$('maxo').value, daily_loss_r:$('dl').value,
   mtf:$('mtf').checked, trail:$('trail').checked, max_group:$('mg').value, max_risk_pct:$('mrp').value,
-  streak_n:$('sn').value, cooldown_min:$('cd').value, max_dd_r:$('mdd').value, time_stop_bars:$('tsb').value, min_evidence:$('mev').value}; }
+  streak_n:$('sn').value, cooldown_min:$('cd').value, max_dd_r:$('mdd').value, time_stop_bars:$('tsb').value, min_evidence:$('mev').value,
+  min_votes:$('mvotes').value, use_model:$('umodel').checked, use_ai:$('uai').checked}; }
 $('start').onclick = async()=>{ msg(); try{ await api('/api/paper/start', cfgBody()); refresh(); }catch(e){ msg(e.message);} };
 $('stop').onclick = async()=>{ msg(); try{ await api('/api/paper/stop'); refresh(); }catch(e){ msg(e.message);} };
 $('resume').onclick = async()=>{ msg(); try{ await api('/api/paper/resume'); refresh(); }catch(e){ msg(e.message);} };
@@ -1591,7 +1868,7 @@ function render(d){
   fill('pend', d.pending, false, 'No waiting orders.');
   fill('closed', d.closed, true, 'No closed trades yet.');
   const e=$('ev'); e.textContent=''; d.events.forEach(x=>e.appendChild(el('div','',x.t+'  '+x.text)));
-  drawCurve(d.curve); bySym(d.by_symbol); exitsTable(s.exits); scoreboard(d.scorecard); prefill(c); alerts(d.events);
+  drawCurve(d.curve); bySym(d.by_symbol); exitsTable(s.exits); scoreboard(d.scorecard); aiboard(d.scorecard, d.ai_tools); prefill(c); alerts(d.events);
 }
 let prefilled = false;
 function prefill(c){
@@ -1600,7 +1877,8 @@ function prefill(c){
   $('risk').value = c.risk; $('lev').value = c.leverage; $('intv').value = String(c.interval);
   const set = (id, v) => { if(v!==undefined && v!==null) $(id).value = v; };
   set('maxo', c.max_open); set('dl', c.daily_loss_r); set('mg', c.max_group); set('mrp', c.max_risk_pct);
-  set('sn', c.streak_n); set('cd', c.cooldown_min); set('mdd', c.max_dd_r); set('tsb', c.time_stop_bars); set('mev', c.min_evidence);
+  set('sn', c.streak_n); set('cd', c.cooldown_min); set('mdd', c.max_dd_r); set('tsb', c.time_stop_bars); set('mev', c.min_evidence); set('mvotes', c.min_votes);
+  if(c.use_model!==undefined) $('umodel').checked = c.use_model; if(c.use_ai!==undefined) $('uai').checked = c.use_ai;
   if(c.mtf!==undefined) $('mtf').checked = c.mtf; if(c.trail!==undefined) $('trail').checked = c.trail;
   fillChartSymbols(); loadChart(true);
 }
@@ -1854,9 +2132,10 @@ function showSignal(d){
   const rec = (tr && (tr.n + tr.expired + tr.void + tr.open) > 0)
     ? ' | App calls on '+d.symbol+': '+tr.hits+' right, '+tr.misses+' wrong'+(tr.n ? ' ('+tr.rate+'%, likely '+tr.lo+'-'+tr.hi+'%, break-even '+tr.breakeven+'%)' : '')+' - '+tr.verdict : '';
   if(!s){ b.textContent = 'Signal: not tracked (this symbol is not in the running trader)'; b.className = 'note'; $('chwhy').textContent = rec; return; }
+  const cl = d.call, vt = cl ? ' | Opinions: '+cl.consensus+' of 4 agree (higher timeframe '+(cl.votes.htf?'yes':'no')+', edge model '+(cl.votes.model==null?'n/a':cl.votes.model?'yes ('+Math.round(cl.model_p*100)+'%)':'no')+', AI '+(cl.ai_verdict?cl.ai_verdict+' '+cl.ai_conf:'n/a')+')' : '';
   b.textContent = 'Signal: '+s.decision;
   b.className = 'tag '+(s.decision.indexOf('BUY')===0 ? 'LONG' : s.decision.indexOf('SELL')===0 ? 'SHORT' : 'WAIT');
-  $('chwhy').textContent = (s.note||'')+(s.reasons&&s.reasons.length?' | '+s.reasons.join('; '):'')+(s.htf?' | higher timeframe: '+s.htf:'')+rec;
+  $('chwhy').textContent = (s.note||'')+(s.reasons&&s.reasons.length?' | '+s.reasons.join('; '):'')+(s.htf?' | higher timeframe: '+s.htf:'')+vt+rec;
 }
 let chartTok = 0;
 async function loadChart(reset){
@@ -2002,8 +2281,9 @@ try{ chist = JSON.parse(sessionStorage.getItem('coach')||'[]'); }catch(e){}
 function cbubble(role, text){ const dv = el('div','cb '+role, text); clog.appendChild(dv); clog.scrollTop = clog.scrollHeight; return dv; }
 if(chist.length) chist.forEach(m=>cbubble(m.role, m.content));
 else cbubble('assistant','Hi! I am your Paper Coach. I can see your paper account and the chart you are looking at, check any symbol, and suggest actions you confirm with one click. Ask me anything, or tap a quick question.');
-const SETMAP = {max_open:'maxo', daily_loss_r:'dl', risk:'risk', max_group:'mg', max_risk_pct:'mrp', streak_n:'sn', cooldown_min:'cd', max_dd_r:'mdd', time_stop_bars:'tsb', min_evidence:'mev'};
-function applySetting(k, v){ if(k==='mtf' || k==='trail') $(k).checked = !!v; else $(SETMAP[k]).value = v; }
+const SETMAP = {max_open:'maxo', daily_loss_r:'dl', risk:'risk', max_group:'mg', max_risk_pct:'mrp', streak_n:'sn', cooldown_min:'cd', max_dd_r:'mdd', time_stop_bars:'tsb', min_evidence:'mev', min_votes:'mvotes'};
+const CHKMAP = {mtf:'mtf', trail:'trail', use_model:'umodel', use_ai:'uai'};
+function applySetting(k, v){ if(CHKMAP[k]) $(CHKMAP[k]).checked = !!v; else $(SETMAP[k]).value = v; }
 function actionButton(a){
   const bt = el('button','cact','Confirm: '+a.label);
   bt.onclick = async()=>{
@@ -2037,6 +2317,20 @@ async function coachSend(text){
 $('cform').addEventListener('submit', e=>{ e.preventDefault(); coachSend($('cq').value); });
 document.querySelectorAll('#cchips button').forEach(bt=>bt.addEventListener('click', ()=>coachSend(bt.dataset.q)));
 $('cclr').addEventListener('click', ()=>{ chist = []; clog.textContent = ''; try{ sessionStorage.removeItem('coach'); }catch(e){} });
+function aiboard(sc, ai){
+  const m = $('aimodels'); m.textContent = '';
+  if(!ai.models.length) m.appendChild(el('p','note','Start the trader to see the AI tools.'));
+  else { tableRow(m,'sc h',[['Symbol'],['Edge model'],[''],[''],['Result on data it never saw']]);
+    ai.models.forEach(x=>tableRow(m,'sc',[[x.symbol],[x.state, x.state==='trusted'?'pos':x.state==='not trusted'?'neg':''],[''],[''],[x.note]])); }
+  $('aistatus').textContent = 'Edge model: '+(ai.use_model?'ON':'OFF')+' | AI second opinion: '+(ai.use_ai ? (ai.ai_key ? 'ON' : 'ON but no GROQ_API_KEY is set') : 'OFF');
+  const v = $('aivotes'); v.textContent = '';
+  tableRow(v,'sc h',[['Opinions agreeing'],['Finished'],['Right'],['Likely range'],['Verdict']]);
+  const names = {1:'1 of 4 (rules only)', 2:'2 of 4', 3:'3 of 4', 4:'4 of 4'};
+  sc.by_votes.forEach(x=>tableRow(v,'sc',[[names[x.votes]],[String(x.n)],[x.n ? x.rate+'%' : '-'],[x.n ? x.lo+'% - '+x.hi+'%' : '-'],[x.verdict]]));
+  const t = sc.voters.map(o=>o.voter+': '+(o.yes.n ? o.yes.rate+'% right when it said yes ('+o.yes.n+')' : 'no finished calls when it said yes')
+    +' vs '+(o.no.n ? o.no.rate+'% when no/unavailable ('+o.no.n+')' : 'none when no')).join('. ');
+  $('aivoters').textContent = t;
+}
 function scoreboard(sc){
   const a = sc.all, g = $('scgrid'); g.textContent = '';
   [['Calls made', a.n + a.expired + a.void + a.open], ['Right (reached target 1)', a.hits], ['Wrong (hit the stop first)', a.misses],
@@ -2057,7 +2351,8 @@ function scoreboard(sc){
   sc.recent.forEach(x=>{
     const word = {hit:'RIGHT', miss:'WRONG', expired:'expired', void:'never triggered', open:'open'}[x.status] || x.status;
     r.appendChild(el('div', x.status==='hit' ? 'pos' : x.status==='miss' ? 'neg' : 'note',
-      x.symbol+' '+x.side+' | entry '+f(x.entry)+' | stop '+f(x.stop)+' | target 1 '+f(x.t1)+' | '+word+' | '+x.age_min+' min ago'));
+      x.symbol+' '+x.side+' | entry '+f(x.entry)+' | stop '+f(x.stop)+' | target 1 '+f(x.t1)+' | '+word+' | '+x.consensus+' of 4 agree'
+      +(x.model_p!=null?' | model '+Math.round(x.model_p*100)+'%':'')+(x.ai_verdict?' | AI: '+x.ai_verdict+' ('+x.ai_conf+')':'')+' | '+x.age_min+' min ago'));
   });
 }
 async function refresh(){ try{ render(await api('/api/paper/status')); }catch(e){ msg(e.message);} }
