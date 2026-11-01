@@ -572,7 +572,7 @@ def _scorecard():
     by_symbol = [dict(_pred_group([p for p in preds if p["symbol"] == sym]), symbol=sym) for sym in syms]
     recent = [{"symbol": p["symbol"], "side": p["side"], "status": p["status"], "entry": p["entry"],
                "stop": p["stop"], "t1": p["t1"], "htf_ok": p.get("htf_ok", False),
-               "consensus": cons(p), "model_p": p.get("model_p"), "ai_verdict": p.get("ai_verdict"),
+               "consensus": cons(p), "blocked": p.get("blocked"), "model_p": p.get("model_p"), "ai_verdict": p.get("ai_verdict"),
                "ai_conf": p.get("ai_conf"), "ai_reason": p.get("ai_reason"),
                "age_min": int((time.time() - p["created"]) // 60)} for p in preds[-12:]][::-1]
     by_votes = [dict(_pred_group([p for p in preds if cons(p) == k]), votes=k) for k in (1, 2, 3, 4)]
@@ -648,6 +648,13 @@ def _pred_create(d, price):
     del STATE["preds"][:-500]
 
 
+def _block(sym, reason):
+    """Remember why a logged call did not become a paper trade (shown next to the call)."""
+    for p in STATE["preds"]:
+        if p["symbol"] == sym and p["status"] == "open":
+            p["blocked"] = reason
+
+
 def _handle(d):
     """Apply one fresh signal to the paper account."""
     sym, price = d["symbol"], d["price"]
@@ -666,47 +673,67 @@ def _handle(d):
     _pred_update(sym, price)
     _pred_create(d, price)
     if not _can_open():
+        if STATE["halted"]:
+            _block(sym, "trading is halted (drawdown limit) - press Resume trading")
+        elif STATE["paused_today"]:
+            _block(sym, "daily loss limit reached - paused until tomorrow")
+        else:
+            _block(sym, "cooling down after losses in a row")
         return
     decision = d.get("decision", "WAIT")
-    if decision == "WAIT" or not d.get("qty") or d["qty"] <= 0:
+    if decision == "WAIT":
+        return
+    if not d.get("qty") or d["qty"] <= 0:
+        _block(sym, "your capital is too small for even 1 unit at this stop distance")
         return
     live = STATE["open"] + STATE["pending"]
-    if any(x["symbol"] == sym for x in live) or len(live) >= _c("max_open"):
+    if any(x["symbol"] == sym for x in live):
+        return                                                # already trading this symbol
+    if len(live) >= _c("max_open"):
+        _block(sym, "max open trades (%d) already reached" % _c("max_open"))
         return
     cfg = STATE["config"]
     cap, risk_money = cfg.get("capital", 0), cfg.get("capital", 0) * cfg.get("risk", 0) / 100.0
     if (len(live) + 1) * risk_money > cap * _c("max_risk_pct") / 100.0 + 1e-9:
+        _block(sym, "total risk limit (%g%% of capital) would be exceeded" % _c("max_risk_pct"))
         return                                                # too much total risk at once
     side = "LONG" if decision.startswith("BUY") else "SHORT"
     sign = 1 if side == "LONG" else -1
     group = _group(d.get("ticker", sym))
     if len([x for x in live if x.get("group") == group and x["side"] == side]) >= _c("max_group"):
+        _block(sym, "you already hold %d %s %s trades (market group limit)" % (_c("max_group"), group, side.lower()))
         return                                                # same bet already taken
     if _c("mtf"):
         htf = d.get("htf")
         if htf is not None and htf != ("up" if side == "LONG" else "down"):
+            _block(sym, "higher-timeframe trend is %s, not %s (higher-timeframe rule)" % (htf, "up" if side == "LONG" else "down"))
             return                                            # higher timeframe disagrees
     need = _c("min_evidence")
     if need:                                                  # trade only symbols whose own record proves an edge
         g = _pred_group([x for x in STATE["preds"] if x["symbol"] == sym])
         if g["n"] < need or g["lo"] <= g["breakeven"]:
+            _block(sym, "evidence rule: %s has %d finished calls and no proven edge yet (needs %d)" % (sym, g["n"], need))
             return
     mv = _c("min_votes")
     if mv:                                                    # trade only when enough independent opinions agree
         cp = next((x for x in STATE["preds"] if x["symbol"] == sym and x["status"] == "open"), None)
         if cp is None or cp.get("consensus", 1) < mv:
+            _block(sym, "only %d of 4 opinions agree (rule needs %d)" % (cp.get("consensus", 1) if cp else 0, mv))
             return
     if decision.endswith("NOW"):
         if not (sign * (price - d["stop"]) > 0 and sign * (d["t1"] - price) > 0):
+            _block(sym, "price already moved too close to the stop or past target 1")
             return
         t = _new_trade(d, side, price)
         t["opened"] = time.time()
         STATE["open"].append(t)
+        _block(sym, None)
         _event("OPEN %s %s at %s | stop %s | T1 %s | qty %s" % (
             side, sym, _f(price), _f(t["stop"]), _f(t["t1"]), t["qty"]))
     else:                                                      # LIMIT order: wait for the entry price
         t = _new_trade(d, side, d["entry"])
         STATE["pending"].append(t)
+        _block(sym, None)
         _event("ORDER %s %s limit at %s | stop %s | T1 %s | qty %s" % (
             side, sym, _f(t["entry"]), _f(t["stop"]), _f(t["t1"]), t["qty"]))
 
@@ -1488,6 +1515,7 @@ def register(app, authorized, live_signal, parse_money, ta):
             track = _pred_group([x for x in STATE["preds"] if x["symbol"] == key])
             cp = next((x for x in STATE["preds"] if x["symbol"] == key and x["status"] == "open"), None)
             call = None if cp is None else {"consensus": cp.get("consensus", 1), "votes": cp.get("votes") or {},
+                                            "blocked": cp.get("blocked"),
                                             "model_p": cp.get("model_p"), "ai_verdict": cp.get("ai_verdict"),
                                             "ai_conf": cp.get("ai_conf"), "ai_reason": cp.get("ai_reason")}
         return jsonify(symbol=key, ticker=ticker, tf=tf, candles=data, trades=trades, marks=marks, signal=signal,
@@ -1777,7 +1805,7 @@ PAGE = r"""<!doctype html>
   <div id="sctable"></div>
   <div id="schtf" class="note" style="margin-top:8px"></div>
   <h2 style="margin-top:14px">Latest calls</h2><div id="screcent"></div>
-  <p class="note">Every BUY/SELL call is logged, even ones your safety rules blocked, and graded later: right = price reached Target 1 first, wrong = it hit the stop first, expired = neither within 20 candles. The range is a 95% statistical range: with few calls it is wide, so do not trust a good-looking rate until the range sits above the break-even rate. Break-even is the win rate needed to cover the risk:reward and costs. No system is right 100% of the time; this page shows the truth instead of a promise.</p></section>
+  <p class="note"><b>A call is not a trade.</b> A call is the app's BUY/SELL idea. It becomes a paper trade only if all your safety rules allow it, and the reason is shown next to each call under Latest calls. Every call is logged, even ones your safety rules blocked, and graded later: right = price reached Target 1 first, wrong = it hit the stop first, expired = neither within 20 candles. The range is a 95% statistical range: with few calls it is wide, so do not trust a good-looking rate until the range sits above the break-even rate. Break-even is the win rate needed to cover the risk:reward and costs. No system is right 100% of the time; this page shows the truth instead of a promise.</p></section>
 <section><h2>AI tools <span class="note">extra opinions on every call, checked by the scorecard</span></h2>
   <div id="aimodels"></div>
   <p class="note" id="aistatus"></p>
@@ -2132,7 +2160,7 @@ function showSignal(d){
   const rec = (tr && (tr.n + tr.expired + tr.void + tr.open) > 0)
     ? ' | App calls on '+d.symbol+': '+tr.hits+' right, '+tr.misses+' wrong'+(tr.n ? ' ('+tr.rate+'%, likely '+tr.lo+'-'+tr.hi+'%, break-even '+tr.breakeven+'%)' : '')+' - '+tr.verdict : '';
   if(!s){ b.textContent = 'Signal: not tracked (this symbol is not in the running trader)'; b.className = 'note'; $('chwhy').textContent = rec; return; }
-  const cl = d.call, vt = cl ? ' | Opinions: '+cl.consensus+' of 4 agree (higher timeframe '+(cl.votes.htf?'yes':'no')+', edge model '+(cl.votes.model==null?'n/a':cl.votes.model?'yes ('+Math.round(cl.model_p*100)+'%)':'no')+', AI '+(cl.ai_verdict?cl.ai_verdict+' '+cl.ai_conf:'n/a')+')' : '';
+  const cl = d.call, vt = cl ? ' | Opinions: '+cl.consensus+' of 4 agree (higher timeframe '+(cl.votes.htf?'yes':'no')+', edge model '+(cl.votes.model==null?'n/a':cl.votes.model?'yes ('+Math.round(cl.model_p*100)+'%)':'no')+', AI '+(cl.ai_verdict?cl.ai_verdict+' '+cl.ai_conf:'n/a')+')'+(cl.blocked ? ' | NO TRADE: '+cl.blocked : '') : '';
   b.textContent = 'Signal: '+s.decision;
   b.className = 'tag '+(s.decision.indexOf('BUY')===0 ? 'LONG' : s.decision.indexOf('SELL')===0 ? 'SHORT' : 'WAIT');
   $('chwhy').textContent = (s.note||'')+(s.reasons&&s.reasons.length?' | '+s.reasons.join('; '):'')+(s.htf?' | higher timeframe: '+s.htf:'')+vt+rec;
@@ -2352,7 +2380,8 @@ function scoreboard(sc){
     const word = {hit:'RIGHT', miss:'WRONG', expired:'expired', void:'never triggered', open:'open'}[x.status] || x.status;
     r.appendChild(el('div', x.status==='hit' ? 'pos' : x.status==='miss' ? 'neg' : 'note',
       x.symbol+' '+x.side+' | entry '+f(x.entry)+' | stop '+f(x.stop)+' | target 1 '+f(x.t1)+' | '+word+' | '+x.consensus+' of 4 agree'
-      +(x.model_p!=null?' | model '+Math.round(x.model_p*100)+'%':'')+(x.ai_verdict?' | AI: '+x.ai_verdict+' ('+x.ai_conf+')':'')+' | '+x.age_min+' min ago'));
+      +(x.model_p!=null?' | model '+Math.round(x.model_p*100)+'%':'')+(x.ai_verdict?' | AI: '+x.ai_verdict+' ('+x.ai_conf+')':'')+' | '+x.age_min+' min ago'
+      +(x.blocked ? ' | NO TRADE: '+x.blocked : (x.status==='open' ? ' | trade opened or order placed' : ''))));
   });
 }
 async function refresh(){ try{ render(await api('/api/paper/status')); }catch(e){ msg(e.message);} }
