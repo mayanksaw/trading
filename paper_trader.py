@@ -16,9 +16,17 @@ Advanced rules (all can be changed on the page)
   - max total risk at once, max open trades, daily loss limit
   - pause after N losses in a row, halt everything at a drawdown limit (Resume button)
 
+Honest accuracy
+  - Prediction scorecard: every BUY/SELL call the app makes is logged and graded later (did price reach
+    Target 1 before the stop?). It shows how often the app was really right, with a statistical range,
+    per symbol, and compares that with the break-even rate. No system is right 100% of the time.
+  - Optional evidence filter: only trade a symbol after its own track record beats break-even.
+
 Tools
   - Live chart: candles / Heikin-Ashi / line, zoom + drag, crosshair, EMA20/50/200, volume, RSI, MACD,
     support / resistance, your entry / stop / targets with profit-loss zones, trade markers, signal badge
+  - Live price: the price, the forming candle, the EMAs and your open-trade result move every ~2 seconds
+    (Yahoo polled every 2 s; crypto can also use a Binance live stream), with up/down flash and a tick sparkline
   - Paper Coach: a small AI chat beside the chart. It sees your account and the chart, can check any
     symbol or backtest it, and proposes actions (close a trade, change a rule) that you confirm with a click
     (needs GROQ_API_KEY; optional GROQ_COACH_MODEL, default llama-3.3-70b-versatile, falls back to GROQ_CHAT_MODEL)
@@ -50,7 +58,7 @@ HTF = {"5m": "1h", "15m": "1h", "30m": "1h", "1h": "1d", "1d": "1wk", "1wk": Non
 
 DEFAULTS = {"max_open": 3, "daily_loss_r": 3.0, "max_group": 2, "max_risk_pct": 3.0,
             "streak_n": 3, "cooldown_min": 60, "max_dd_r": 10.0, "mtf": True,
-            "trail": False, "time_stop_bars": 20}
+            "trail": False, "time_stop_bars": 20, "min_evidence": 0}
 
 _lock = threading.RLock()
 _lab_lock = threading.Lock()
@@ -68,7 +76,8 @@ def _fresh():
     return {"enabled": False, "config": {}, "open": [], "pending": [], "closed": [],
             "events": [], "heartbeat": 0.0, "day": "", "day_r": 0.0,
             "paused_today": False, "next_id": 1, "start_capital": 0.0,
-            "streak": 0, "cooldown_until": 0.0, "halted": False, "dd_anchor": 0.0}
+            "streak": 0, "cooldown_until": 0.0, "halted": False, "dd_anchor": 0.0,
+            "preds": [], "next_pred": 1}
 
 
 def _load():
@@ -304,6 +313,104 @@ def _manage_pending(t, price):
                                                           _f(t["stop"]), _f(t["t1"])))
 
 
+PRED_BARS = 20            # a call is graded within this many candles
+
+
+def _wilson(k, n, z=1.96):
+    """95% range for a hit rate measured on n calls (small samples give a wide range)."""
+    if n == 0:
+        return 0.0, 1.0
+    p = k / n
+    den = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * ((p * (1 - p) + z * z / (4 * n)) / n) ** 0.5
+    return (centre - margin) / den, (centre + margin) / den
+
+
+def _pred_group(preds):
+    done = [p for p in preds if p["status"] in ("hit", "miss")]
+    n = len(done)
+    hits = sum(1 for p in done if p["status"] == "hit")
+    lo, hi = _wilson(hits, n)
+    rrs = [p["rr"] for p in done if p.get("rr")]
+    avg_rr = sum(rrs) / len(rrs) if rrs else 1.5
+    be = 1.0 / (1.0 + avg_rr) + 0.03                      # win rate needed to break even, plus a cost buffer
+    if n < 10:
+        verdict = "too early (%d of 10 finished calls)" % n
+    elif lo > be:
+        verdict = "edge looks real"
+    elif hi < be:
+        verdict = "worse than break-even"
+    else:
+        verdict = "not proven yet"
+    return {"n": n, "hits": hits, "misses": n - hits,
+            "expired": sum(1 for p in preds if p["status"] == "expired"),
+            "void": sum(1 for p in preds if p["status"] == "void"),
+            "open": sum(1 for p in preds if p["status"] == "open"),
+            "rate": round(100.0 * hits / n, 1) if n else 0.0, "lo": round(100 * lo, 1), "hi": round(100 * hi, 1),
+            "breakeven": round(100 * be, 1), "verdict": verdict}
+
+
+def _scorecard():
+    preds = STATE["preds"]
+    syms = sorted({p["symbol"] for p in preds})
+    by_symbol = [dict(_pred_group([p for p in preds if p["symbol"] == sym]), symbol=sym) for sym in syms]
+    recent = [{"symbol": p["symbol"], "side": p["side"], "status": p["status"], "entry": p["entry"],
+               "stop": p["stop"], "t1": p["t1"], "htf_ok": p.get("htf_ok", False),
+               "age_min": int((time.time() - p["created"]) // 60)} for p in preds[-12:]][::-1]
+    return {"all": _pred_group(preds), "by_symbol": sorted(by_symbol, key=lambda g: -g["n"]),
+            "htf_agrees": _pred_group([p for p in preds if p.get("htf_ok")]),
+            "htf_other": _pred_group([p for p in preds if not p.get("htf_ok")]), "recent": recent}
+
+
+def _pred_update(sym, price):
+    """Grade open calls: did price reach Target 1 before the stop?"""
+    now = time.time()
+    for p in [x for x in STATE["preds"] if x["symbol"] == sym and x["status"] == "open"]:
+        sign = 1 if p["side"] == "LONG" else -1
+        if not p["armed"]:                                    # limit call: wait for price to reach the entry
+            if sign * (price - p["stop"]) <= 0 or sign * (price - p["t1"]) >= 0 or now > p["expires"]:
+                p["status"], p["closed"] = "void", now        # never triggered
+            elif sign * (price - p["entry"]) <= 0:
+                p["armed"], p["armed_at"] = True, now
+            continue
+        if sign * (price - p["t1"]) >= 0:
+            p["status"], p["closed"] = "hit", now
+        elif sign * (price - p["stop"]) <= 0:
+            p["status"], p["closed"] = "miss", now
+        elif now > p["armed_at"] + p["horizon"]:
+            p["status"], p["closed"] = "expired", now
+
+
+def _pred_create(d, price):
+    """Log every BUY/SELL call (even ones the safety rules block) so its accuracy can be measured."""
+    decision = d.get("decision", "WAIT")
+    if decision == "WAIT":
+        return
+    sym = d["symbol"]
+    if any(p["symbol"] == sym and p["status"] == "open" for p in STATE["preds"]):
+        return
+    side = "LONG" if decision.startswith("BUY") else "SHORT"
+    sign = 1 if side == "LONG" else -1
+    now_call = decision.endswith("NOW")
+    entry, stop, t1 = (price if now_call else d.get("entry")), d.get("stop"), d.get("t1")
+    if entry is None or stop is None or t1 is None:
+        return
+    if not (sign * (entry - stop) > 0 and sign * (t1 - entry) > 0):
+        return
+    if now_call and not (sign * (price - stop) > 0 and sign * (t1 - price) > 0):
+        return
+    now = time.time()
+    horizon = PRED_BARS * TF_MIN.get(d.get("tf", "15m"), 15) * 60
+    STATE["preds"].append({
+        "id": STATE["next_pred"], "symbol": sym, "tf": d.get("tf"), "side": side, "entry": entry, "stop": stop,
+        "t1": t1, "rr": abs(t1 - entry) / abs(entry - stop), "status": "open", "armed": now_call,
+        "armed_at": now if now_call else 0.0, "created": now, "closed": 0.0, "horizon": horizon,
+        "expires": now + horizon, "htf_ok": d.get("htf") == ("up" if side == "LONG" else "down")})
+    STATE["next_pred"] += 1
+    del STATE["preds"][:-500]
+
+
 def _handle(d):
     """Apply one fresh signal to the paper account."""
     sym, price = d["symbol"], d["price"]
@@ -317,7 +424,11 @@ def _handle(d):
         _manage_pending(t, price)
     for t in [x for x in STATE["open"] if x["symbol"] == sym]:
         _manage_open(t, price)
-    if stale or not _can_open():
+    if stale:
+        return
+    _pred_update(sym, price)
+    _pred_create(d, price)
+    if not _can_open():
         return
     decision = d.get("decision", "WAIT")
     if decision == "WAIT" or not d.get("qty") or d["qty"] <= 0:
@@ -338,6 +449,11 @@ def _handle(d):
         htf = d.get("htf")
         if htf is not None and htf != ("up" if side == "LONG" else "down"):
             return                                            # higher timeframe disagrees
+    need = _c("min_evidence")
+    if need:                                                  # trade only symbols whose own record proves an edge
+        g = _pred_group([x for x in STATE["preds"] if x["symbol"] == sym])
+        if g["n"] < need or g["lo"] <= g["breakeven"]:
+            return
     if decision.endswith("NOW"):
         if not (sign * (price - d["stop"]) > 0 and sign * (d["t1"] - price) > 0):
             return
@@ -490,7 +606,8 @@ GROQ_URL_DEFAULT = "https://api.groq.com/openai/v1/chat/completions"
 SETTABLE = {"max_open": ("int", 1, 8), "daily_loss_r": ("float", 0.5, 10), "risk": ("float", 0.1, 10),
             "max_group": ("int", 1, 8), "max_risk_pct": ("float", 0.5, 20), "streak_n": ("int", 0, 10),
             "cooldown_min": ("int", 1, 1440), "max_dd_r": ("float", 0, 100),
-            "time_stop_bars": ("int", 0, 500), "mtf": ("bool",), "trail": ("bool",)}
+            "time_stop_bars": ("int", 0, 500), "mtf": ("bool",), "trail": ("bool",),
+            "min_evidence": ("int", 0, 200)}
 
 COACH_SYSTEM = """You are Paper Coach, a sharp and honest trading coach inside a PAPER-TRADING (fake money) app.
 You can see the user's paper account and the chart they are looking at (data below), and you have tools.
@@ -501,6 +618,7 @@ How to work:
 - Be honest about weak evidence: fewer than 30 closed trades is too few to judge a strategy. Point out risk problems (many trades in one market group, big drawdown, no stop-loss thinking).
 - Never promise profit and never say a trade will win. When you discuss a setup, remind briefly that this is paper trading and not financial advice. No real broker is connected.
 - Reply in the language the user writes in (English, Hindi or Hinglish). Keep answers short (under 120 words unless asked for detail). Plain text only: no markdown symbols, no tables; short lines are fine.
+- If the user asks for guaranteed, certain or 100% correct predictions, explain kindly that this is impossible for anyone, and point to the scorecard of the app's real hit rate instead.
 - If the question is not about trading, markets or this app, politely say you only help with trading."""
 
 _TF_ENUM = ["5m", "15m", "30m", "1h", "1d", "1wk"]
@@ -596,6 +714,47 @@ def _chart_data(ta, ticker, tf, bars=300):
         return data
 
 
+_tick_cache = {}
+_tick_hits = {}
+
+
+def _yahoo_tick(ticker):
+    """Latest price straight from Yahoo's quote data (cached ~1 s so several viewers share one request)."""
+    hit = _tick_cache.get(ticker)
+    if hit and time.time() - hit[0] < 1.0:
+        return hit[1]
+    import requests
+    from urllib.parse import quote
+    r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/" + quote(ticker, safe=""),
+                     params={"interval": "1d", "range": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+    if r.status_code != 200:
+        raise RuntimeError("Yahoo answered %s" % r.status_code)
+    meta = r.json()["chart"]["result"][0]["meta"]
+    price = _clean(meta.get("regularMarketPrice"))
+    if price is None:
+        raise RuntimeError("No live price for %s" % ticker)
+    out = {"price": price, "t": int(meta.get("regularMarketTime") or time.time()),
+           "prev_close": _clean(meta.get("chartPreviousClose") or meta.get("previousClose")), "delayed": False}
+    if len(_tick_cache) > 60:
+        _tick_cache.clear()
+    _tick_cache[ticker] = (time.time(), out)
+    return out
+
+
+def _tick_limited(limit=90, window=60):
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
+    now = time.time()
+    if len(_tick_hits) > 200:
+        _tick_hits.clear()
+    q = _tick_hits.setdefault(ip, deque())
+    while q and now - q[0] > window:
+        q.popleft()
+    if len(q) >= limit:
+        return True
+    q.append(now)
+    return False
+
+
 def _snapshot(ta, sym, tf):
     """What an analyst would note about the chart right now (used by the coach)."""
     ticker = ta.resolve_symbol(sym)
@@ -658,6 +817,11 @@ def _account_brief():
                 s["trades"], " (too few to judge)" if s["trades"] < 30 else "", s["win_rate"], s["total_r"],
                 s["avg_r"], s["profit_factor"] if s["profit_factor"] is not None else "-", s["max_dd_r"],
                 s["max_loss_streak"], s["start"], s["balance"], s["profit"])]
+        sc = _pred_group(STATE["preds"])
+        rows.append("Scorecard of the app's own BUY/SELL calls: %d finished (%d right, %d wrong), %d expired or never "
+                    "triggered, %d open | right %.0f%% (likely range %.0f-%.0f%%) | break-even needs %.0f%% | %s" % (
+                        sc["n"], sc["hits"], sc["misses"], sc["expired"] + sc["void"], sc["open"], sc["rate"],
+                        sc["lo"], sc["hi"], sc["breakeven"], sc["verdict"]))
         for t in STATE["open"]:
             rows.append("OPEN #%d %s %s entry %s stop %s T1 %s now %+.2fR%s" % (
                 t["id"], t["side"], t["symbol"], _f(t["entry"]), _f(t["stop"]), _f(t["t1"]), _now_r(t),
@@ -902,7 +1066,8 @@ def register(app, authorized, live_signal, parse_money, ta):
                "cooldown_min": _num(d, "cooldown_min", 60, 1, 1440, int),
                "max_dd_r": _num(d, "max_dd_r", 10.0, 0.0, 100.0),
                "time_stop_bars": _num(d, "time_stop_bars", 20, 0, 500, int),
-               "mtf": bool(d.get("mtf", True)), "trail": bool(d.get("trail", False))}
+               "mtf": bool(d.get("mtf", True)), "trail": bool(d.get("trail", False)),
+               "min_evidence": _num(d, "min_evidence", 0, 0, 200, int)}
         with _lock:
             STATE["config"] = cfg
             STATE["enabled"] = True
@@ -968,7 +1133,7 @@ def register(app, authorized, live_signal, parse_money, ta):
                 stats=_stats(), open=[_view(t) for t in STATE["open"]],
                 pending=[_view(t) for t in STATE["pending"]],
                 closed=[_view(t) for t in STATE["closed"][-20:]][::-1],
-                events=STATE["events"][:25], curve=_curve(), by_symbol=_by_symbol())
+                events=STATE["events"][:25], curve=_curve(), by_symbol=_by_symbol(), scorecard=_scorecard())
 
     @app.post("/api/paper/close")
     def paper_close():
@@ -1005,6 +1170,30 @@ def register(app, authorized, live_signal, parse_money, ta):
         out, code = _run_lab(ta, sym, tf)
         return jsonify(out), code
 
+    @app.post("/api/paper/tick")
+    def paper_tick():
+        d = request.get_json(silent=True) or {}
+        if not guard(d):
+            return jsonify(error="Wrong password"), 401
+        if _tick_limited():
+            return jsonify(error="Too many price checks."), 429
+        sym, tf = str(d.get("symbol", "")).strip(), d.get("tf", "15m")
+        if not sym or len(sym) > 20:
+            return jsonify(error="Bad symbol."), 400
+        ticker = ta.resolve_symbol(sym)
+        try:
+            out = dict(_yahoo_tick(ticker))
+        except Exception as e:
+            try:                                           # fall back to the newest candle close
+                data = _chart_data(ta, ticker, tf if tf in ta.TIMEFRAMES else "15m")
+            except Exception:
+                data = None
+            if not data:
+                return jsonify(error="No live price: %s" % str(e)[:80]), 502
+            out = {"price": data["c"][-1], "t": int(time.time()), "prev_close": None, "delayed": True}
+        out["ticker"] = ticker
+        return jsonify(out)
+
     @app.post("/api/paper/chart")
     def paper_chart():
         d = request.get_json(silent=True) or {}
@@ -1027,15 +1216,18 @@ def register(app, authorized, live_signal, parse_money, ta):
                 for t in lst:
                     if t["symbol"] == key:
                         trades.append({"id": t["id"], "kind": kind, "side": t["side"], "entry": t["entry"],
-                                       "stop": t["stop"], "t1": t["t1"], "t2": t["t2"],
-                                       "trail": bool(t.get("trail"))})
+                                       "stop": t["stop"], "stop0": t.get("stop0", t["stop"]), "t1": t["t1"],
+                                       "t2": t["t2"], "trail": bool(t.get("trail")),
+                                       "risk_money": round(_rm(t), 2)})
                         if t.get("opened"):
                             marks.append({"t": int(t["opened"]), "price": t["entry"], "side": t["side"], "r": None})
             for c in STATE["closed"][-60:]:
                 if c["symbol"] == key and c.get("opened"):
                     marks.append({"t": int(c["opened"]), "price": c["entry"], "side": c["side"], "r": c["r"]})
             signal = _last_sig.get(key)
-        return jsonify(symbol=key, ticker=ticker, tf=tf, candles=data, trades=trades, marks=marks, signal=signal)
+            track = _pred_group([x for x in STATE["preds"] if x["symbol"] == key])
+        return jsonify(symbol=key, ticker=ticker, tf=tf, candles=data, trades=trades, marks=marks, signal=signal,
+                       track=track)
 
     @app.post("/api/paper/chat")
     def paper_chat():
@@ -1100,6 +1292,9 @@ def register(app, authorized, live_signal, parse_money, ta):
         for key in ("open", "pending", "closed"):
             if not all(isinstance(t, dict) and all(k in t for k in TRADE_KEYS) for t in s[key]):
                 return jsonify(error="The backup file is damaged (%s trades)." % key), 400
+        if not all(isinstance(x, dict) and all(k in x for k in ("symbol", "side", "status", "entry", "stop", "t1", "created"))
+                   for x in s["preds"]):
+            return jsonify(error="The backup file is damaged (predictions)."), 400
         if not all("r" in t for t in s["closed"]):
             return jsonify(error="The backup file is damaged (closed trades)."), 400
         s["enabled"] = False
@@ -1173,6 +1368,8 @@ PAGE = r"""<!doctype html>
   .tgl{display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:4px}
   .tgl label.chk{margin-top:6px;font-size:.8rem}
   .tag.WAIT{background:#4a5563}
+  .sc{display:grid;grid-template-columns:1.2fr .7fr .8fr 1.3fr 2fr;gap:6px;font-size:.82rem;padding:6px 0;border-bottom:1px solid #2c3a4a}
+  .sc.h{color:#9aa4af;font-size:.75rem}
   #coach{display:flex;flex-direction:column;height:640px}
   #clog{flex:1;overflow-y:auto;display:grid;gap:8px;align-content:start;margin-bottom:8px;padding-right:2px}
   .cb{padding:8px 12px;border-radius:10px;white-space:pre-wrap;word-break:break-word;font-size:.88rem;line-height:1.4;max-width:94%}
@@ -1183,6 +1380,16 @@ PAGE = r"""<!doctype html>
   .cact{display:block;margin-top:8px;padding:7px 10px;font-size:.8rem;background:#1f7a3d;border-radius:6px;text-align:left;flex:none;width:100%}
   #cform{display:flex;gap:8px;margin-top:6px}
   #cform input{flex:1;min-width:0}
+  .live{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;padding:8px 10px;background:#0f1419;border:1px solid #2c3a4a;border-radius:8px}
+  .lvbox{padding:2px 8px;border-radius:6px}
+  .lvprice{font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums}
+  .lvprice.up{color:#4cc27a} .lvprice.down{color:#ff8a8a}
+  .fu{animation:fu .7s ease-out} .fd{animation:fd .7s ease-out}
+  @keyframes fu{from{background:rgba(63,185,80,.55)}to{background:transparent}}
+  @keyframes fd{from{background:rgba(248,81,73,.55)}to{background:transparent}}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:#4a5563}
+  .dot.live{background:#3fb950;animation:pulse 1.2s infinite} .dot.slow{background:#f0b429} .dot.dead{background:#f85149}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.7)}70%{box-shadow:0 0 0 8px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
   .clear{background:none;border:0;color:#9aa4af;font-size:.8rem;cursor:pointer;padding:4px 0;flex:none}
 </style></head><body>
 <h1>Paper Trader <span class="note">fake money, real signals</span></h1>
@@ -1223,6 +1430,7 @@ PAGE = r"""<!doctype html>
       <label>Pause for (minutes)<input id="cd" type="number" min="1" max="1440" value="60"></label>
     </div>
     <div class="row">
+      <label>Trade a symbol only after its own record proves an edge (finished calls needed, 0 = off)<input id="mev" type="number" min="0" max="200" value="0"></label>
       <label>Halt everything at drawdown (R, 0 = off)<input id="mdd" type="number" step="any" min="0" max="100" value="10"></label>
       <label>Time stop: close if Target 1 is not reached after (candles, 0 = off)<input id="tsb" type="number" min="0" max="500" value="20"></label>
     </div>
@@ -1259,10 +1467,19 @@ PAGE = r"""<!doctype html>
     <button class="grey" id="zlatest" type="button" style="flex:none;padding:6px 12px;font-size:.85rem">Latest</button>
     <label class="chk" style="margin:0 0 0 auto"><input id="chauto" type="checkbox" checked> Auto-update</label>
   </div>
+  <div class="live" id="livebar">
+    <span id="lvdot" class="dot"></span><b id="lvsym">-</b>
+    <span class="lvbox" id="lvbox"><span class="lvprice" id="lvprice">-</span></span>
+    <span id="lvchg" class="note"></span>
+    <svg id="lvspark" viewBox="0 0 120 28" width="120" height="28"></svg>
+    <label class="chk" style="margin:0 0 0 auto;font-size:.78rem"><input id="chws" type="checkbox" checked> Fast crypto stream (Binance)</label>
+  </div>
+  <div class="note" id="lvsrc" style="margin-top:4px"></div>
+  <div id="lvtr" style="margin-top:4px;font-size:.85rem"></div>
   <div style="margin-top:8px"><span id="chsig" class="note"></span> <span class="note" id="chwhy"></span></div>
   <svg id="chart" viewBox="0 0 760 360" style="width:100%;height:auto;margin-top:8px;background:#0f1419;border-radius:8px;touch-action:pan-y;user-select:none"></svg>
   <p class="note" id="chinfo">Loading chart...</p>
-  <p class="note">Drag the chart to move through time. Ctrl + mouse wheel (or the Zoom buttons) changes how many candles you see. Move the mouse over the chart for the crosshair. Yellow = EMA20, blue = EMA50, purple = EMA200. Dashed lines = your open trade (entry blue, stop red, targets green); the shaded zones show profit (green) and loss (red). Triangles = where trades were entered (blue open, green won, red lost). Prices come from Yahoo and can be a little late; Indian markets are closed on weekends.</p>
+  <p class="note">Drag the chart to move through time. Ctrl + mouse wheel (or the Zoom buttons) changes how many candles you see. Move the mouse over the chart for the crosshair. Yellow = EMA20, blue = EMA50, purple = EMA200. Dashed lines = your open trade (entry blue, stop red, targets green); the shaded zones show profit (green) and loss (red). Triangles = where trades were entered (blue open, green won, red lost). The price at the top moves live: Yahoo is checked every 2 seconds (the last candle, EMA lines and your trade result move with it), and for crypto the Binance live stream makes it tick even faster. Stocks and Indian indices can be delayed by Yahoo and stand still when the market is closed. The trader itself checks stops and targets every 30 seconds or more.</p>
 </section>
 <section id="coach">
   <h2>Paper Coach <span class="note" id="cmode">AI chat</span></h2>
@@ -1285,6 +1502,13 @@ PAGE = r"""<!doctype html>
   <p class="note">Uses the timeframe above and the same BUY/SELL rules, with an estimated cost per trade subtracted. A symbol "passes" with at least 30 trades, a positive result after costs and a profit factor of 1.1 or more. Past results are not a promise.</p></section>
 <section><h2>Result so far <span class="note">money in your capital currency, and in R</span></h2><div class="grid" id="stats"></div>
   <p class="note">Money = result in R x the amount you risk per trade (capital x risk %), so BTC (USD), Nifty (INR) and forex all add up in one currency. Fees and slippage (0.05% per side) are included. Profit factor = total won / total lost (above 1.3 is decent).</p></section>
+<section><h2>Prediction scorecard <span class="note">how often the app's calls were really right</span></h2>
+  <div class="grid" id="scgrid"></div>
+  <p id="scverdict" class="warn"></p>
+  <div id="sctable"></div>
+  <div id="schtf" class="note" style="margin-top:8px"></div>
+  <h2 style="margin-top:14px">Latest calls</h2><div id="screcent"></div>
+  <p class="note">Every BUY/SELL call is logged, even ones your safety rules blocked, and graded later: right = price reached Target 1 first, wrong = it hit the stop first, expired = neither within 20 candles. The range is a 95% statistical range: with few calls it is wide, so do not trust a good-looking rate until the range sits above the break-even rate. Break-even is the win rate needed to cover the risk:reward and costs. No system is right 100% of the time; this page shows the truth instead of a promise.</p></section>
 <section><h2>Money curve</h2><svg id="curve" viewBox="0 0 700 150" style="width:100%;height:150px"></svg></section>
 <section><h2>Which symbols work</h2><div id="bysym"></div>
   <h2 style="margin-top:14px">How trades ended</h2><div id="exits"></div></section>
@@ -1315,7 +1539,7 @@ async function api(path, body){
 function cfgBody(){ return {symbols:$('syms').value, tf:$('tf').value, capital:$('cap').value, risk:$('risk').value,
   leverage:$('lev').value, interval:$('intv').value, max_open:$('maxo').value, daily_loss_r:$('dl').value,
   mtf:$('mtf').checked, trail:$('trail').checked, max_group:$('mg').value, max_risk_pct:$('mrp').value,
-  streak_n:$('sn').value, cooldown_min:$('cd').value, max_dd_r:$('mdd').value, time_stop_bars:$('tsb').value}; }
+  streak_n:$('sn').value, cooldown_min:$('cd').value, max_dd_r:$('mdd').value, time_stop_bars:$('tsb').value, min_evidence:$('mev').value}; }
 $('start').onclick = async()=>{ msg(); try{ await api('/api/paper/start', cfgBody()); refresh(); }catch(e){ msg(e.message);} };
 $('stop').onclick = async()=>{ msg(); try{ await api('/api/paper/stop'); refresh(); }catch(e){ msg(e.message);} };
 $('resume').onclick = async()=>{ msg(); try{ await api('/api/paper/resume'); refresh(); }catch(e){ msg(e.message);} };
@@ -1367,7 +1591,7 @@ function render(d){
   fill('pend', d.pending, false, 'No waiting orders.');
   fill('closed', d.closed, true, 'No closed trades yet.');
   const e=$('ev'); e.textContent=''; d.events.forEach(x=>e.appendChild(el('div','',x.t+'  '+x.text)));
-  drawCurve(d.curve); bySym(d.by_symbol); exitsTable(s.exits); prefill(c); alerts(d.events);
+  drawCurve(d.curve); bySym(d.by_symbol); exitsTable(s.exits); scoreboard(d.scorecard); prefill(c); alerts(d.events);
 }
 let prefilled = false;
 function prefill(c){
@@ -1376,7 +1600,7 @@ function prefill(c){
   $('risk').value = c.risk; $('lev').value = c.leverage; $('intv').value = String(c.interval);
   const set = (id, v) => { if(v!==undefined && v!==null) $(id).value = v; };
   set('maxo', c.max_open); set('dl', c.daily_loss_r); set('mg', c.max_group); set('mrp', c.max_risk_pct);
-  set('sn', c.streak_n); set('cd', c.cooldown_min); set('mdd', c.max_dd_r); set('tsb', c.time_stop_bars);
+  set('sn', c.streak_n); set('cd', c.cooldown_min); set('mdd', c.max_dd_r); set('tsb', c.time_stop_bars); set('mev', c.min_evidence);
   if(c.mtf!==undefined) $('mtf').checked = c.mtf; if(c.trail!==undefined) $('trail').checked = c.trail;
   fillChartSymbols(); loadChart(true);
 }
@@ -1472,6 +1696,9 @@ function fillChartSymbols(){
   loadChart(true);
 }
 const CS = {data:null, n:100, off:0, ctx:null};
+const LV = {price:null, prev:null, dir:0, t:0, lastOk:0, src:'', hist:[], ticker:'', prevClose:null, pollPrice:null,
+            ws:null, wsOk:false, wsPrice:null, wsOff:0, wsLast:0, wsTry:0, wsAligned:false, mouse:null};
+const TFSEC = {'5m':300, '15m':900, '30m':1800, '1h':3600};
 function haSeries(c){
   const o=[], h=[], l=[], cl=[];
   for(let i=0;i<c.t.length;i++){
@@ -1565,7 +1792,7 @@ function drawChart(){
     const pts = m.side==='LONG' ? [x,y-3, x-6,y+8, x+6,y+8] : [x,y+3, x-6,y-8, x+6,y-8];
     g.appendChild(svgEl('polygon',{points:pts.join(','),fill:col,stroke:'#0f1419'}));
   });
-  const last = c.c[N-1], ly = Y(last), upl = last >= c.o[N-1];
+  const last = c.c[N-1], ly = Y(last), upl = LV.dir ? LV.dir > 0 : last >= c.o[N-1];
   g.appendChild(svgEl('line',{x1:L,x2:L+PW,y1:ly,y2:ly,stroke:'#9aa4af','stroke-dasharray':'2 3'}));
   if(last>=lo && last<=hi){
     svg.appendChild(svgEl('rect',{x:L+PW+1,y:ly-9,width:R-2,height:18,fill:upl?'#1f7a3d':'#a33a3a',rx:3}));
@@ -1623,11 +1850,13 @@ function moveCross(e){
     +'  O '+f(c.o[i])+'  H '+f(c.h[i])+'  L '+f(c.l[i])+'  C '+f(c.c[i])+(c.rsi[i]!=null?'  RSI '+c.rsi[i].toFixed(0):'');
 }
 function showSignal(d){
-  const s = d.signal, b = $('chsig');
-  if(!s){ b.textContent = 'Signal: not tracked (this symbol is not in the running trader)'; b.className = 'note'; $('chwhy').textContent = ''; return; }
+  const s = d.signal, b = $('chsig'), tr = d.track;
+  const rec = (tr && (tr.n + tr.expired + tr.void + tr.open) > 0)
+    ? ' | App calls on '+d.symbol+': '+tr.hits+' right, '+tr.misses+' wrong'+(tr.n ? ' ('+tr.rate+'%, likely '+tr.lo+'-'+tr.hi+'%, break-even '+tr.breakeven+'%)' : '')+' - '+tr.verdict : '';
+  if(!s){ b.textContent = 'Signal: not tracked (this symbol is not in the running trader)'; b.className = 'note'; $('chwhy').textContent = rec; return; }
   b.textContent = 'Signal: '+s.decision;
   b.className = 'tag '+(s.decision.indexOf('BUY')===0 ? 'LONG' : s.decision.indexOf('SELL')===0 ? 'SHORT' : 'WAIT');
-  $('chwhy').textContent = (s.note||'')+(s.reasons&&s.reasons.length?' | '+s.reasons.join('; '):'')+(s.htf?' | higher timeframe: '+s.htf:'');
+  $('chwhy').textContent = (s.note||'')+(s.reasons&&s.reasons.length?' | '+s.reasons.join('; '):'')+(s.htf?' | higher timeframe: '+s.htf:'')+rec;
 }
 let chartTok = 0;
 async function loadChart(reset){
@@ -1640,7 +1869,9 @@ async function loadChart(reset){
     if(old && CS.off>0){ let added = 0; for(let i=c.t.length-1; i>=0 && c.t[i] > old.t[old.t.length-1]; i--) added++; CS.off += added; }
     if(reset || !old) CS.off = 0;
     c.ha = haSeries(c); CS.data = d;
-    drawChart(); showSignal(d);
+    if(LV.ticker !== d.ticker){ LV.price = null; LV.prev = null; LV.dir = 0; LV.hist = []; LV.pollPrice = null; LV.prevClose = null; LV.ticker = d.ticker; connectWs(); }
+    else if(LV.price != null) touchCandle(LV.price, Math.max(LV.t, c.t[c.t.length-1]));
+    drawChart(); showSignal(d); renderLive();
   }catch(e){ if(tok === chartTok) $('chinfo').textContent = e.message; }
 }
 function zoomBy(k){ if(!CS.data) return; CS.n = Math.max(20, Math.min(CS.data.candles.t.length, Math.round(CS.n*k))); drawChart(); }
@@ -1659,18 +1890,119 @@ svgc.addEventListener('pointermove', e=>{
     const r = svgc.getBoundingClientRect(), per = (CS.ctx.PW/CS.ctx.n)/(CS.ctx.W/r.width);
     CS.off = Math.max(0, Math.min(CS.data.candles.t.length - CS.n, drag.off + Math.round((e.clientX-drag.x)/per)));
     drawChart();
-  } else moveCross(e);
+  } else { LV.mouse = {clientX:e.clientX, clientY:e.clientY}; moveCross(e); }
 });
-svgc.addEventListener('pointerleave', ()=>{ if(CS.ctx) CS.ctx.xh.setAttribute('visibility','hidden'); });
+svgc.addEventListener('pointerleave', ()=>{ LV.mouse = null; if(CS.ctx) CS.ctx.xh.setAttribute('visibility','hidden'); });
 svgc.addEventListener('wheel', e=>{ if(!(e.ctrlKey||e.metaKey)) return; e.preventDefault(); zoomBy(e.deltaY>0 ? 1.2 : 0.83); }, {passive:false});
 setInterval(()=>{ if(!document.hidden && $('chauto').checked) loadChart(false); }, 8000);
+
+function emaStep(prev, price, span){ if(prev==null) return price; const a = 2/(span+1); return a*price + (1-a)*prev; }
+function touchCandle(price, ts){
+  const d = CS.data; if(!d) return;
+  const c = d.candles; let N = c.t.length; const per = TFSEC[d.tf], start = c.t[N-1];
+  if(per && ts >= start + per){                                   // a new candle has started
+    const k = Math.floor((ts-start)/per), po = c.c[N-1];
+    c.t.push(start + k*per); c.o.push(po); c.h.push(Math.max(po,price)); c.l.push(Math.min(po,price)); c.c.push(price); c.v.push(0);
+    c.e20.push(emaStep(c.e20[N-1], price, 20)); c.e50.push(emaStep(c.e50[N-1], price, 50)); c.e200.push(emaStep(c.e200[N-1], price, 200));
+    c.rsi.push(c.rsi[N-1]); c.macd.push(c.macd[N-1]);
+    if(CS.off>0) CS.off += 1;
+  } else if(ts >= start || !per){                                 // the candle that is forming now
+    c.c[N-1] = price; if(price > c.h[N-1]) c.h[N-1] = price; if(price < c.l[N-1]) c.l[N-1] = price;
+    c.e20[N-1] = emaStep(c.e20[N-2], price, 20); c.e50[N-1] = emaStep(c.e50[N-2], price, 50); c.e200[N-1] = emaStep(c.e200[N-2], price, 200);
+  } else return;
+  c.ha = haSeries(c);
+}
+function flash(box, cls){ box.classList.remove('fu','fd'); void box.offsetWidth; box.classList.add(cls); }
+let drawTimer = null;
+function scheduleDraw(){
+  if(drawTimer) return;
+  drawTimer = setTimeout(()=>{ drawTimer = null; drawChart(); if(LV.mouse && !drag) moveCross(LV.mouse); renderLive(); }, 150);
+}
+function applyTick(price, ts, src){
+  if(!(price > 0) || !CS.data) return;
+  const was = LV.price != null ? LV.price : CS.data.candles.c[CS.data.candles.c.length-1];   // first tick: compare with the chart's last close
+  if(price !== was) LV.dir = price > was ? 1 : -1;
+  LV.prev = was; LV.price = price; LV.t = ts; LV.lastOk = Date.now(); LV.src = src; LV.ticker = CS.data.ticker;
+  LV.hist.push(price); if(LV.hist.length > 120) LV.hist.shift();
+  touchCandle(price, ts);
+  if(price > was) flash($('lvbox'),'fu'); else if(price < was) flash($('lvbox'),'fd');
+  scheduleDraw();
+}
+function ago(sec){ sec = Math.max(0, Math.round(sec)); return sec < 120 ? sec+' s' : sec < 7200 ? Math.round(sec/60)+' min' : Math.round(sec/3600)+' h'; }
+function renderLive(){
+  const d = CS.data; if(!d || LV.price == null) return;
+  $('lvsym').textContent = d.symbol;
+  const pe = $('lvprice'); pe.textContent = f(LV.price); pe.className = 'lvprice '+(LV.dir>0 ? 'up' : LV.dir<0 ? 'down' : '');
+  const ce = $('lvchg');
+  if(LV.prevClose){ const ch = LV.price - LV.prevClose, pc = ch/LV.prevClose*100;
+    ce.textContent = (ch>=0?'+':'')+f(ch)+' ('+(pc>=0?'+':'')+pc.toFixed(2)+'%) today'; ce.className = ch>=0 ? 'pos' : 'neg'; }
+  const sp = $('lvspark'); sp.textContent = ''; const h = LV.hist;
+  if(h.length > 1){
+    const lo = Math.min(...h), hi = Math.max(...h), span = (hi-lo) || 1;
+    sp.appendChild(svgEl('polyline',{points:h.map((v,i)=>(i*(120/(h.length-1))).toFixed(1)+','+(26-(v-lo)/span*24).toFixed(1)).join(' '),
+      fill:'none',stroke:h[h.length-1]>=h[0] ? '#4cc27a' : '#ff8a8a','stroke-width':1.5}));
+  }
+  const age = (Date.now()-LV.lastOk)/1000, mAge = Date.now()/1000 - LV.t;
+  let label = 'LIVE', cls = 'dot live';
+  if(age > 20){ label = 'NO FEED'; cls = 'dot dead'; }
+  else if(age > 6){ label = 'SLOW'; cls = 'dot slow'; }
+  else if(LV.src !== 'stream' && mAge > 900){ label = 'MARKET CLOSED (last price '+ago(mAge)+' old)'; cls = 'dot slow'; }
+  $('lvdot').className = cls;
+  $('lvsrc').textContent = label+' | '+(LV.src==='stream' ? 'Binance live stream, aligned to Yahoo prices' : LV.src==='delayed' ? 'delayed price from the last candle' : 'Yahoo, checked every 2 seconds')
+    +' | last update '+ago(age)+' ago'+(LV.pollErr ? ' | '+LV.pollErr : '');
+  const box = $('lvtr'); box.textContent = '';
+  d.trades.filter(t=>t.kind==='open').forEach(t=>{
+    const sign = t.side==='LONG' ? 1 : -1, risk = Math.abs(t.entry - t.stop0) || 1, r = sign*(LV.price - t.entry)/risk;
+    box.appendChild(el('div', r>=0?'pos':'neg', 'My '+t.side+' trade: '+(r>=0?'+':'')+r.toFixed(2)+'R (about '+mn(r*t.risk_money)+' money) | stop '+f(t.stop)+' | target 1 '+f(t.t1)));
+  });
+}
+async function pollTick(){
+  if(document.hidden || !CS.data) return;
+  const sym = $('chsym').value; if(!sym) return;
+  try{
+    const d = await api('/api/paper/tick',{symbol:sym, tf:$('chtf').value});
+    if(sym !== $('chsym').value || !CS.data || d.ticker !== CS.data.ticker) return;
+    LV.pollPrice = d.price; if(d.prev_close) LV.prevClose = d.prev_close; LV.pollErr = '';
+    if(LV.wsOk && LV.wsPrice != null){ const target = d.price - LV.wsPrice; LV.wsOff = LV.wsAligned ? LV.wsOff + (target-LV.wsOff)*0.1 : target; LV.wsAligned = true; }
+    if(!(LV.wsOk && Date.now() - LV.wsLast < 3000)) applyTick(d.price, d.t || Math.floor(Date.now()/1000), d.delayed ? 'delayed' : 'yahoo');
+    else renderLive();
+  }catch(e){ LV.pollErr = e.message; renderLive(); }
+}
+function closeWs(){
+  if(LV.ws){ try{ LV.ws.onmessage = null; LV.ws.onclose = null; LV.ws.close(); }catch(e){} }
+  LV.ws = null; LV.wsOk = false; LV.wsPrice = null; LV.wsAligned = false;
+}
+function binancePair(t){ return /-USD$/.test(t) ? t.replace(/-USD$/,'').toLowerCase()+'usdt' : null; }
+function connectWs(){
+  closeWs(); LV.wsTry = Date.now();
+  if(!$('chws').checked || !CS.data) return;
+  const pair = binancePair(CS.data.ticker); if(!pair) return;
+  try{
+    const w = new WebSocket('wss://stream.binance.com:9443/ws/'+pair+'@trade'); LV.ws = w;
+    w.onmessage = ev=>{ try{
+      const m = JSON.parse(ev.data), p = parseFloat(m.p); if(!(p > 0)) return;
+      LV.wsOk = true; LV.wsPrice = p; LV.wsLast = Date.now();
+      if(LV.pollPrice != null){
+        if(!LV.wsAligned){ LV.wsOff = LV.pollPrice - p; LV.wsAligned = true; }
+        applyTick(p + LV.wsOff, Math.floor((m.T || Date.now())/1000), 'stream');
+      }
+    }catch(e){} };
+    w.onerror = ()=>{ LV.wsOk = false; }; w.onclose = ()=>{ LV.wsOk = false; };
+  }catch(e){ LV.wsOk = false; }
+}
+function wsWatch(){
+  if($('chws').checked && CS.data && binancePair(CS.data.ticker) && (!LV.ws || LV.ws.readyState === 3) && Date.now() - LV.wsTry > 8000) connectWs();
+}
+$('chws').onchange = connectWs;
+setInterval(pollTick, 2000);
+setInterval(()=>{ renderLive(); wsWatch(); }, 1000);
 
 const clog = $('clog'); let chist = [];
 try{ chist = JSON.parse(sessionStorage.getItem('coach')||'[]'); }catch(e){}
 function cbubble(role, text){ const dv = el('div','cb '+role, text); clog.appendChild(dv); clog.scrollTop = clog.scrollHeight; return dv; }
 if(chist.length) chist.forEach(m=>cbubble(m.role, m.content));
 else cbubble('assistant','Hi! I am your Paper Coach. I can see your paper account and the chart you are looking at, check any symbol, and suggest actions you confirm with one click. Ask me anything, or tap a quick question.');
-const SETMAP = {max_open:'maxo', daily_loss_r:'dl', risk:'risk', max_group:'mg', max_risk_pct:'mrp', streak_n:'sn', cooldown_min:'cd', max_dd_r:'mdd', time_stop_bars:'tsb'};
+const SETMAP = {max_open:'maxo', daily_loss_r:'dl', risk:'risk', max_group:'mg', max_risk_pct:'mrp', streak_n:'sn', cooldown_min:'cd', max_dd_r:'mdd', time_stop_bars:'tsb', min_evidence:'mev'};
 function applySetting(k, v){ if(k==='mtf' || k==='trail') $(k).checked = !!v; else $(SETMAP[k]).value = v; }
 function actionButton(a){
   const bt = el('button','cact','Confirm: '+a.label);
@@ -1705,6 +2037,29 @@ async function coachSend(text){
 $('cform').addEventListener('submit', e=>{ e.preventDefault(); coachSend($('cq').value); });
 document.querySelectorAll('#cchips button').forEach(bt=>bt.addEventListener('click', ()=>coachSend(bt.dataset.q)));
 $('cclr').addEventListener('click', ()=>{ chist = []; clog.textContent = ''; try{ sessionStorage.removeItem('coach'); }catch(e){} });
+function scoreboard(sc){
+  const a = sc.all, g = $('scgrid'); g.textContent = '';
+  [['Calls made', a.n + a.expired + a.void + a.open], ['Right (reached target 1)', a.hits], ['Wrong (hit the stop first)', a.misses],
+   ['Expired / never triggered', a.expired + a.void], ['Still open', a.open], ['Right so far', a.n ? a.rate+'%' : '-'],
+   ['Likely true rate', a.n ? a.lo+'% to '+a.hi+'%' : '-'], ['Break-even needs', a.breakeven+'%']].forEach(x=>{
+    const b = el('div','box'); b.appendChild(el('b','',String(x[1]))); b.appendChild(el('span','',x[0])); g.appendChild(b); });
+  $('scverdict').textContent = a.n ? 'Verdict: '+a.verdict+'.' : 'No finished calls yet. Let the trader run for a few days.';
+  const t = $('sctable'); t.textContent = '';
+  if(sc.by_symbol.length){
+    tableRow(t,'sc h',[['Symbol'],['Finished'],['Right'],['Likely range'],['Verdict']]);
+    sc.by_symbol.forEach(x=>tableRow(t,'sc',[[x.symbol],[String(x.n)],[x.n ? x.rate+'%' : '-', x.n && x.rate >= x.breakeven ? 'pos' : ''],
+      [x.n ? x.lo+'% - '+x.hi+'%' : '-'],[x.verdict, x.verdict==='edge looks real' ? 'pos' : x.verdict==='worse than break-even' ? 'neg' : '']]));
+  }
+  const ag = sc.htf_agrees, ot = sc.htf_other;
+  $('schtf').textContent = (ag.n+ot.n) ? 'Higher timeframe agreed: '+(ag.n ? ag.rate+'% right' : 'no finished calls')+' ('+ag.n+' calls). Did not agree or not checked: '+(ot.n ? ot.rate+'% right' : 'no finished calls')+' ('+ot.n+' calls).' : '';
+  const r = $('screcent'); r.textContent = '';
+  if(!sc.recent.length) r.appendChild(el('p','note','No calls yet.'));
+  sc.recent.forEach(x=>{
+    const word = {hit:'RIGHT', miss:'WRONG', expired:'expired', void:'never triggered', open:'open'}[x.status] || x.status;
+    r.appendChild(el('div', x.status==='hit' ? 'pos' : x.status==='miss' ? 'neg' : 'note',
+      x.symbol+' '+x.side+' | entry '+f(x.entry)+' | stop '+f(x.stop)+' | target 1 '+f(x.t1)+' | '+word+' | '+x.age_min+' min ago'));
+  });
+}
 async function refresh(){ try{ render(await api('/api/paper/status')); }catch(e){ msg(e.message);} }
 refresh(); setInterval(refresh, 5000); fillChartSymbols();
 </script></body></html>"""
