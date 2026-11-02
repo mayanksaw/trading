@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 
 from flask import Response, jsonify, request
 
+PAPER_VERSION = "1.0"
 STATE_FILE = os.getenv("PAPER_STATE_FILE", "paper_state.json")
 FEE_PCT = 0.05            # cost per side, percent of trade value (fees + slippage)
 PENDING_MAX_AGE = 3600    # seconds a limit order may wait before it is cancelled
@@ -78,7 +79,7 @@ def _fresh():
             "events": [], "heartbeat": 0.0, "day": "", "day_r": 0.0,
             "paused_today": False, "next_id": 1, "start_capital": 0.0,
             "streak": 0, "cooldown_until": 0.0, "halted": False, "dd_anchor": 0.0,
-            "preds": [], "next_pred": 1}
+            "preds": [], "next_pred": 1, "pid": 0}
 
 
 def _load():
@@ -94,6 +95,7 @@ def _load():
 
 def _save():
     try:
+        STATE["pid"] = os.getpid()
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(STATE, fh)
@@ -648,6 +650,107 @@ def _pred_create(d, price):
     del STATE["preds"][:-500]
 
 
+def _selfcheck(ta, client_time=None):
+    """Plain-language health check of everything the trader depends on."""
+    checks = []
+
+    def add(name, ok, detail, fix=""):
+        checks.append({"name": name, "ok": ok, "detail": detail, "fix": fix})
+    cfg = STATE["config"]
+    sym = (cfg.get("symbols") or ["btc"])[0]
+    tf = cfg.get("tf", "15m")
+    if tf not in ta.TIMEFRAMES:
+        tf = "15m"
+    with _lock:
+        alive = _thread is not None and _thread.is_alive()
+        age = time.time() - STATE["heartbeat"] if STATE["heartbeat"] else None
+        enabled = STATE["enabled"]
+    interval = cfg.get("interval", 60)
+    if not cfg:
+        add("Trader", None, "Not started yet.", "Choose your symbols and press Start.")
+    elif not enabled:
+        add("Trader", None, "Stopped.", "Press Start to continue.")
+    elif alive and age is not None and age < max(180, interval * 4):
+        add("Trader", True, "Running. Last check %d seconds ago." % age)
+    else:
+        add("Trader", False, "Marked as running, but there has been no recent check.",
+            "Render may have restarted or gone to sleep. Press Start. For 24-hour running, add a free UptimeRobot "
+            "ping to your-site/health every 5 minutes.")
+    ticker = ta.resolve_symbol(sym)
+    try:
+        data = _chart_data(ta, ticker, tf)
+        if data:
+            add("Price history", True, "%s %s: %d candles, newest started %d min ago." % (
+                sym.upper(), tf, len(data["t"]), (time.time() - data["t"][-1]) / 60))
+        else:
+            add("Price history", False, "No price data for %s." % ticker, "Check the symbol spelling, or try again in a minute.")
+    except Exception as e:
+        add("Price history", False, "Could not load: %s" % str(e)[:80], "Yahoo may be busy. Try again in a minute.")
+    try:
+        _tick_cache.pop(ticker, None)
+        q = _yahoo_tick(ticker)
+        quote_age = time.time() - q["t"]
+        if quote_age > 1200:
+            add("Live price", None, "%s %s, but the quote is %d min old (market closed?)." % (sym.upper(), _f(q["price"]), quote_age / 60),
+                "Normal for Indian stocks and indices outside market hours.")
+        else:
+            add("Live price", True, "%s is %s (quote %d s old)." % (sym.upper(), _f(q["price"]), quote_age))
+    except Exception as e:
+        add("Live price", None, "Yahoo quote failed (%s). The chart falls back to delayed prices." % str(e)[:60], "Usually fixes itself in a minute.")
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        add("AI (Groq)", None, "GROQ_API_KEY is not set, so the coach, the AI second opinion and screenshot reading are off.",
+            "Add GROQ_API_KEY in Render under Environment.")
+    else:
+        try:
+            _coach_call(ta, key, [{"role": "user", "content": "Reply with the single word OK."}], False, max_tokens=8)
+            add("AI (Groq)", True, "The AI answered.")
+        except Exception as e:
+            busy = "rate limit" in str(e)
+            add("AI (Groq)", None if busy else False, "AI problem: %s" % str(e)[:90],
+                "Rate limits clear after a minute." if busy else "Check the key and model names in Render, and the Groq console.")
+    tools = _ai_tools_view()
+    trusted = sum(1 for m in tools["models"] if m["state"] == "trusted")
+    add("Edge model", True if tools["models"] else None,
+        ", ".join("%s: %s" % (m["symbol"], m["state"]) for m in tools["models"]) or "Starts after you press Start.",
+        "" if trusted else "'not trusted' just means it found no clear edge on unseen data. That is an honest answer.")
+    path = os.path.abspath(STATE_FILE)
+    try:
+        with open(path + ".check", "w") as fh:
+            fh.write("ok")
+        os.remove(path + ".check")
+        if path.startswith("/var/data"):
+            add("Saved data", True, "Saved on a permanent disk: %s" % path)
+        else:
+            add("Saved data", None, "Saved to %s. On Render's free plan this file is erased on every redeploy or restart." % path,
+                "Keep the 'automatic backup' option ticked: this browser stores a copy and restores it by itself. For permanent "
+                "storage add a Render disk and set PAPER_STATE_FILE=/var/data/paper_state.json.")
+    except Exception as e:
+        add("Saved data", False, "Cannot write %s (%s)." % (path, str(e)[:50]), "Set PAPER_STATE_FILE to a folder you can write to.")
+    try:
+        with open(STATE_FILE) as fh:
+            disk_pid = json.load(fh).get("pid")
+        if disk_pid and disk_pid != os.getpid() and time.time() - os.path.getmtime(STATE_FILE) < 180:
+            add("Server processes", False, "Another server process saved the data %d s ago, so two copies are running." %
+                (time.time() - os.path.getmtime(STATE_FILE)), "In render.yaml use: gunicorn app:app --workers 1 --threads 4 --timeout 120")
+        else:
+            add("Server processes", True, "One server process.")
+    except Exception:
+        add("Server processes", None, "Not enough saved data yet to check.")
+    add("Password", True if os.getenv("APP_PASSWORD") else None,
+        "APP_PASSWORD is set." if os.getenv("APP_PASSWORD") else "No APP_PASSWORD: anyone who knows your link can start, stop or reset the trader.",
+        "" if os.getenv("APP_PASSWORD") else "Add APP_PASSWORD in Render under Environment.")
+    if client_time:
+        try:
+            skew = abs(time.time() - float(client_time))
+            add("Clock", skew < 60, "Your device and the server differ by %d seconds." % skew,
+                "" if skew < 60 else "Set your device clock to automatic. The live chart depends on it.")
+        except (TypeError, ValueError):
+            pass
+    add("Version", True, "Paper Trader %s" % PAPER_VERSION)
+    return checks
+
+
 def _block(sym, reason):
     """Remember why a logged call did not become a paper trade (shown next to the call)."""
     for p in STATE["preds"]:
@@ -741,13 +844,25 @@ def _handle(d):
 # ------------------------------------------------------------------ background worker
 def _worker():
     while not _stop.is_set():
+        try:
+            if _worker_round() is False:
+                return
+        except Exception as e:                                # keep the trader alive whatever happens
+            with _lock:
+                _event("Trader round failed and will retry (%s)" % str(e)[:80])
+            _stop.wait(10)
+
+
+def _worker_round():
+    """One pass over all symbols. Returns False when the trader should stop."""
+    if True:
         with _lock:
             if not STATE["enabled"]:
-                return
+                return False
             cfg = dict(STATE["config"])
         for sym in cfg.get("symbols", []):
             if _stop.is_set():
-                return
+                return False
             d, err = None, ""
             try:
                 d = _live(sym, cfg["tf"], cfg["capital"], cfg["risk"], cfg["leverage"])
@@ -762,19 +877,28 @@ def _worker():
                 d, err = None, str(e)[:100]
             with _lock:
                 if not STATE["enabled"]:
-                    return
+                    return False
                 _roll_day()
                 if d is None:
                     _event("%s: could not get data (%s)" % (sym.upper(), err))
                 else:
-                    _handle(d)
+                    try:
+                        _handle(d)
+                    except Exception as e:                    # one bad result must never stop the trader
+                        _event("%s: internal error, skipped this check (%s)" % (sym.upper(), str(e)[:80]))
                 STATE["heartbeat"] = time.time()
                 _save()
         _stop.wait(cfg.get("interval", 60))
+        return True
 
 
 def _start_thread():
     global _thread
+    with _lock:
+        if _thread is not None and _thread.is_alive() and not _stop.is_set():
+            return                                            # already running
+    if _thread is not None and _thread.is_alive():
+        _thread.join(timeout=3)                               # it was told to stop: let it finish first
     with _lock:
         if _thread is not None and _thread.is_alive():
             return
@@ -1420,7 +1544,7 @@ def register(app, authorized, live_signal, parse_money, ta):
                 pending=[_view(t) for t in STATE["pending"]],
                 closed=[_view(t) for t in STATE["closed"][-20:]][::-1],
                 events=STATE["events"][:25], curve=_curve(), by_symbol=_by_symbol(), scorecard=_scorecard(),
-                ai_tools=_ai_tools_view())
+                ai_tools=_ai_tools_view(), version=PAPER_VERSION)
 
     @app.post("/api/paper/close")
     def paper_close():
@@ -1560,6 +1684,15 @@ def register(app, authorized, live_signal, parse_money, ta):
         return jsonify(reply=reply or "Sorry, I could not answer that. Try rephrasing.",
                        actions=actions, used=used, mode="ai")
 
+    @app.post("/api/paper/selfcheck")
+    def paper_selfcheck():
+        d = request.get_json(silent=True) or {}
+        if not guard(d):
+            return jsonify(error="Wrong password"), 401
+        if _chat_limited(6, 60):
+            return jsonify(error="Too many checks. Wait a minute."), 429
+        return jsonify(checks=_selfcheck(ta, d.get("client_time")), version=PAPER_VERSION)
+
     @app.post("/api/paper/backup")
     def paper_backup():
         d = request.get_json(silent=True) or {}
@@ -1589,14 +1722,18 @@ def register(app, authorized, live_signal, parse_money, ta):
             return jsonify(error="The backup file is damaged (predictions)."), 400
         if not all("r" in t for t in s["closed"]):
             return jsonify(error="The backup file is damaged (closed trades)."), 400
-        s["enabled"] = False
+        resume = bool(d.get("resume")) and bool(data.get("enabled")) and bool(s["config"].get("symbols"))
+        s["enabled"] = resume
         _stop.set()
         with _lock:
             STATE = s
             _recent.clear()
-            _event("Backup restored. Press Start to continue.")
+            _event("Backup restored%s." % (" and trading resumed" if resume else ". Press Start to continue"))
             _save()
-        return jsonify(ok=True)
+        if resume:
+            _start_thread()
+            threading.Thread(target=_warm_models, args=(dict(s["config"]),), daemon=True).start()
+        return jsonify(ok=True, resumed=resume)
 
     @app.post("/api/paper/csv")
     def paper_csv():
@@ -1664,6 +1801,8 @@ PAGE = r"""<!doctype html>
   .sc{display:grid;grid-template-columns:1.2fr .7fr .8fr 1.3fr 2fr;gap:6px;font-size:.82rem;padding:6px 0;border-bottom:1px solid #2c3a4a}
   .sc.h{color:#9aa4af;font-size:.75rem}
   .chk.sm{font-size:.8rem}
+  .ck{display:grid;grid-template-columns:52px 1.2fr 3fr;gap:8px;padding:6px 0;border-bottom:1px solid #2c3a4a;font-size:.85rem}
+  .ck .fix{color:#f0b429;font-size:.8rem;grid-column:2 / 4}
   #coach{display:flex;flex-direction:column;height:640px}
   #clog{flex:1;overflow-y:auto;display:grid;gap:8px;align-content:start;margin-bottom:8px;padding-right:2px}
   .cb{padding:8px 12px;border-radius:10px;white-space:pre-wrap;word-break:break-word;font-size:.88rem;line-height:1.4;max-width:94%}
@@ -1819,11 +1958,17 @@ PAGE = r"""<!doctype html>
 <section><h2>Open trades</h2><div id="open"></div><h2 style="margin-top:12px">Waiting limit orders</h2><div id="pend"></div></section>
 <section><h2>Closed trades (last 20)</h2><div id="closed"></div></section>
 <section><h2>Log</h2><div id="ev"></div></section>
+<section><h2>System check <span class="note">find and fix problems yourself</span></h2>
+  <div class="btns"><button id="sck" class="grey" type="button" style="flex:none">Run system check</button></div>
+  <div id="sckout"></div></section>
 <section><h2>Backup</h2>
   <p class="note">Render forgets everything when it redeploys. Download a backup before you change any code, and restore it afterwards.</p>
   <div class="btns"><button id="bk" class="grey">Backup (.json)</button><button id="csvb" class="grey">Trades (.csv)</button><button id="rs" class="grey">Restore</button></div>
   <input type="file" id="rsf" accept=".json" style="display:none">
+  <label class="chk"><input id="abck" type="checkbox" checked> Keep an automatic backup in this browser, and restore it by itself if Render forgets the data</label>
+  <p class="note" id="abinfo"></p>
 </section>
+<p class="note" id="ver"></p>
 <p class="note">Paper results are not a promise of real results. Real markets have gaps, delays and bigger slippage. Not financial advice.</p>
 <script>
 const $ = id => document.getElementById(id);
@@ -1849,7 +1994,7 @@ $('start').onclick = async()=>{ msg(); try{ await api('/api/paper/start', cfgBod
 $('stop').onclick = async()=>{ msg(); try{ await api('/api/paper/stop'); refresh(); }catch(e){ msg(e.message);} };
 $('resume').onclick = async()=>{ msg(); try{ await api('/api/paper/resume'); refresh(); }catch(e){ msg(e.message);} };
 $('reset').onclick = async()=>{ if(!confirm('Delete all paper trades and history?')) return;
-  msg(); try{ await api('/api/paper/reset'); prefilled=false; refresh(); }catch(e){ msg(e.message);} };
+  msg(); try{ try{ localStorage.removeItem(AB_KEY); }catch(x){} await api('/api/paper/reset'); prefilled=false; refresh(); }catch(e){ msg(e.message);} };
 $('start').addEventListener('click', ()=>{ try{ if('Notification' in window && Notification.permission==='default') Notification.requestPermission(); }catch(e){} });
 document.querySelectorAll('.chips button').forEach(b=>b.onclick=()=>{ $('syms').value = b.dataset.s; fillChartSymbols(); });
 
@@ -2384,6 +2529,51 @@ function scoreboard(sc){
       +(x.blocked ? ' | NO TRADE: '+x.blocked : (x.status==='open' ? ' | trade opened or order placed' : ''))));
   });
 }
-async function refresh(){ try{ render(await api('/api/paper/status')); }catch(e){ msg(e.message);} }
+const AB_KEY = 'paper_auto_backup';
+let abBusy = false, abLast = 0, abRestored = false;
+function abOn(){ try{ return localStorage.getItem('paper_ab_off') !== '1'; }catch(e){ return true; } }
+function serverEmpty(d){ const a = d.scorecard.all; return !(d.config && d.config.symbols) && d.stats.trades===0 && !d.open.length && !d.pending.length && (a.n+a.expired+a.void+a.open)===0; }
+async function autoBackup(d){
+  if(!abOn() || abBusy || serverEmpty(d) || Date.now()-abLast < 120000) return;
+  abBusy = true;
+  try{
+    const state = await api('/api/paper/backup');
+    localStorage.setItem(AB_KEY, JSON.stringify({t:Date.now(), state:state}));
+    abLast = Date.now(); $('abinfo').textContent = 'Automatic backup saved in this browser at '+new Date().toLocaleTimeString()+'.';
+  }catch(e){ $('abinfo').textContent = 'Automatic backup failed: '+e.message; }
+  abBusy = false;
+}
+async function autoRestore(d){
+  if(!abOn() || abRestored || !serverEmpty(d)) return;
+  let b = null; try{ b = JSON.parse(localStorage.getItem(AB_KEY) || 'null'); }catch(e){}
+  if(!b || !b.state || !b.state.config || !b.state.config.symbols) return;
+  abRestored = true;
+  try{
+    await api('/api/paper/restore',{state:b.state, resume:true}); prefilled = false;
+    $('abinfo').textContent = 'The server had lost its data (Render restarted). Restored automatically from your browser backup of '+new Date(b.t).toLocaleString()+'.';
+    refresh();
+  }catch(e){ $('abinfo').textContent = 'Automatic restore failed: '+e.message; }
+}
+$('abck').checked = abOn();
+$('abck').onchange = ()=>{ try{ localStorage.setItem('paper_ab_off', $('abck').checked ? '0' : '1'); }catch(e){} };
+$('sck').onclick = async()=>{
+  const out = $('sckout'); out.textContent = 'Checking... this can take up to 20 seconds.'; $('sck').disabled = true; msg();
+  try{
+    const d = await api('/api/paper/selfcheck',{client_time: Math.floor(Date.now()/1000)});
+    const rows = d.checks.slice();
+    let bk = 'none yet'; try{ const b = JSON.parse(localStorage.getItem(AB_KEY) || 'null'); if(b) bk = new Date(b.t).toLocaleString(); }catch(e){}
+    rows.splice(rows.length-1, 0, {name:'Browser backup', ok: abOn() ? true : null, detail: abOn() ? 'Automatic backup in this browser: '+bk : 'Automatic backup is switched off.', fix: abOn() ? '' : 'Tick the automatic backup box in the Backup section.'});
+    out.textContent = '';
+    rows.forEach(x=>{
+      const r = el('div','ck');
+      r.appendChild(el('b', x.ok===true ? 'pos' : x.ok===false ? 'neg' : 'note', x.ok===true ? 'OK' : x.ok===false ? 'FIX' : 'NOTE'));
+      r.appendChild(el('span','',x.name)); r.appendChild(el('span','note',x.detail));
+      if(x.fix) r.appendChild(el('span','fix','What to do: '+x.fix));
+      out.appendChild(r);
+    });
+  }catch(e){ out.textContent = ''; msg(e.message); }
+  $('sck').disabled = false;
+};
+async function refresh(){ try{ const d = await api('/api/paper/status'); render(d); $('ver').textContent = 'Paper Trader '+d.version; autoRestore(d); autoBackup(d); }catch(e){ msg(e.message);} }
 refresh(); setInterval(refresh, 5000); fillChartSymbols();
 </script></body></html>"""
